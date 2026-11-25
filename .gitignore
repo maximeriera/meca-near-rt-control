@@ -1,0 +1,7 @@
+# measurement runs (large binary data) and caches
+meca_latency_*/
+*.npz
+*.pkl.gz
+__pycache__/
+.pytest_cache/
+aggregate*/
