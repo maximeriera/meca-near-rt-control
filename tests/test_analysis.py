@@ -66,6 +66,29 @@ def test_closed_loop_low_frequency_gain_is_one():
         assert abs(abs(m.closed_loop_frf(0.01, 20.0, mdl, ff, 0.014)) - 1) < 1e-3
 
 
+# --------------------------------------------------------------------------- replay reference
+def test_action_ref_uses_only_released_actions():
+    t = np.array([0.0, 0.02, 0.04, 0.06])
+    q = np.zeros((4, m.NJ))
+    q[:, 0] = [0.0, 1.0, 2.0, 3.0]                    # 50 deg/s
+    R = m.ActionRef(t, q, release=[0.0, 0.0, 0.04, 0.04], horizon=0.04)   # chunks of 2
+    assert R.at(0.01, now=0.01)[0] == pytest.approx(0.5)      # interpolated inside the known chunk
+    assert R.at(0.03, now=0.03)[0] == pytest.approx(1.5)      # next chunk not out yet: extrapolated
+    assert R.slope(0.05, now=0.03)[0] == pytest.approx(50.0)
+    assert R.at(0.20, now=0.03)[0] == pytest.approx(3.0)      # extrapolation capped by the horizon
+    assert R.at(0.20, now=1.0)[0] == pytest.approx(3.0)       # trajectory over: held
+    assert R.slope(0.20, now=1.0)[0] == 0.0
+
+
+def test_policy_effects_chunks_and_release():
+    a = m.parse_args(["--ref-chunk", "4", "--ref-chunk-offset-deg", "0.5", "--ref-jitter-ms", "3"])
+    t = np.arange(0, 0.2, 0.02)
+    q, rel = m.policy_effects(t, np.zeros((len(t), m.NJ)), a, [5])
+    assert np.all(rel[:4] == rel[0]) and rel[4] >= t[4]       # a chunk is released at once, never early
+    assert np.all(q[:4, 5] == 0) and np.ptp(q[4:8, 5]) == 0   # first chunk clean, one offset per chunk
+    assert np.all(q[:, :5] == 0)                              # inactive joints untouched
+
+
 # --------------------------------------------------------------------------- end to end (simulator)
 def _sim(tmp_path, *args):
     out = tmp_path / "run"
@@ -90,6 +113,16 @@ def test_sim_servomulti_matches_model(tmp_path):
     S = _sim(tmp_path, "--tests", "step,servomulti", "--multi-joints", "1,6", "--servomulti-freqs", "1")
     for r in S["servomulti"]["rows"]:
         assert abs(r["err_rms_pct"] - r["model_err_rms_pct"]) < 3
+
+
+def test_sim_replay_all_interfaces(tmp_path):
+    S = _sim(tmp_path, "--tests", "step,replay", "--multi-joints", "1,6", "--replay-dur", "3",
+             "--ref-chunk", "8", "--ref-noise-deg", "0.02", "--ref-jitter-ms", "5", "--ref-chunk-offset-deg", "0.1")
+    rows = S["replay"]["rows"]
+    assert {(r["mode"], r["joint"]) for r in rows} == {(mo, j) for mo in ("vel", "ff", "pos") for j in (1, 6)}
+    for r in rows:
+        assert -5 < r["delay_ms"] < 150, r
+        assert r["rel_err_pct"] < 80, r
 
 
 # --------------------------------------------------------------------------- recorded runs (slow)

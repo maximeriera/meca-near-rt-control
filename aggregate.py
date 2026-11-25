@@ -20,6 +20,7 @@ Tables written (only those with data):
   posstep.csv        MoveJoints sizes               posstream.csv   MoveJoints streams
   posinterrupt.csv   ClearMotion re-targeting       servo_steps.csv / servo_sines.csv
   servomulti.csv     host loop on several joints at once
+  replay.csv         policy-like action streams per interface and joint (with the stream settings)
 """
 from __future__ import annotations
 
@@ -46,6 +47,8 @@ SECTIONS = {
     "servo_steps": lambda S: (S.get("servo") or {}).get("steps"),
     "servo_sines": lambda S: (S.get("servo") or {}).get("sines"),
     "servomulti": lambda S: (S.get("servomulti") or {}).get("rows"),
+    "replay": lambda S: [{**{k: v for k, v in S["replay"].items() if k not in ("rows", "per_mode")}, **r}
+                         for r in S["replay"]["rows"]] if S.get("replay") else None,
 }
 
 

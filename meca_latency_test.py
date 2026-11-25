@@ -53,6 +53,11 @@ Tests (--tests: comma separated names and/or groups vel, pos, servo, all)
               all compared with the identified model
   servomulti  the same loop on every --multi-joints joint at once (sines in phase, with / without
               feedforward): does tracking hold when all joints move?
+ Physical AI
+  replay      a policy-like action stream on --multi-joints (CSV --ref-file, or synthetic motion with
+              --ref-chunk / --ref-noise-deg / --ref-jitter-ms / --ref-chunk-offset-deg) through
+              --replay-modes vel (loop + feedforward), ff (feedforward only), pos (MoveJoints stream):
+              error, delay, error once delayed, smoothness, backlog
   timing      (always) RT frame period / missing frames, feedback transport, send jitter
 
 Usage
@@ -90,8 +95,9 @@ from datetime import datetime
 
 import numpy as np
 
-# Nominal Meca500 R3 joint speed limits at 100 % SetJointVelLimit (deg/s).
-# Check them against your robot's manual / firmware version (R4 differs).
+# Meca500 joint speed limits at 100 % SetJointVelLimit (deg/s). Measured with the vmaxcheck test
+# on a Meca500 R4, firmware 11.3.1 (2026-11-25): equal to these nominal values. A MoveJointsVel
+# above the limit is clamped silently, not refused. Override with --joint-vmax if yours differ.
 JOINT_VMAX = [150.0, 150.0, 180.0, 300.0, 300.0, 500.0]
 NJ = 6
 ENC_STEP = 0.000862          # J6 encoder step seen in rt_joint_pos [deg]
@@ -116,7 +122,8 @@ TEST_GROUPS = {
     "pos": ["posstep", "posstream", "posinterrupt"],
     "servo": ["servo"],
 }
-TEST_GROUPS["all"] = ["vmaxcheck"] + TEST_GROUPS["vel"] + TEST_GROUPS["pos"] + TEST_GROUPS["servo"] + ["servomulti"]
+TEST_GROUPS["all"] = (["vmaxcheck"] + TEST_GROUPS["vel"] + TEST_GROUPS["pos"] + TEST_GROUPS["servo"]
+                      + ["servomulti", "replay"])
 
 
 def col(kind: int, j: int) -> int:
@@ -613,6 +620,110 @@ def piecewise(segs):
     bounds = np.cumsum([s[0] for s in segs])
     vals = [s[1] for s in segs]
     return lambda t: vals[min(int(np.searchsorted(bounds, t + 1e-9, side="right")), len(vals) - 1)]
+
+
+class ActionRef:
+    """A stream of actions q_k (offsets from the start pose, deg, one row of 6 per action) due at
+    t_k and known to the controller from release_k on (a policy that is late, or that publishes a
+    whole chunk at once). What the controller can compute at time `now` for time te: linear
+    interpolation of the released actions; past the last released one, its last slope continues
+    for at most `horizon` (a late action), then the position is held."""
+
+    def __init__(self, t, q, release, horizon):
+        self.t = np.asarray(t, float)
+        self.q = np.asarray(q, float)
+        self.rel = np.maximum.accumulate(np.asarray(release, float))
+        self.s = np.zeros_like(self.q)
+        if len(self.t) > 1:
+            self.s[:-1] = np.diff(self.q, axis=0) / np.diff(self.t)[:, None]
+        self.horizon = horizon
+
+    def released(self, now):
+        return int(np.searchsorted(self.rel, now, side="right"))
+
+    def at(self, te, now):
+        n = self.released(now)
+        if n == 0:
+            return np.zeros(NJ)
+        i = int(np.searchsorted(self.t[:n], te, side="right")) - 1
+        if i < 0:
+            return self.q[0].copy()
+        if i < n - 1:
+            return self.q[i] + self.s[i] * (te - self.t[i])
+        if n == 1 or n == len(self.t):
+            return self.q[n - 1].copy()
+        return self.q[n - 1] + self.s[n - 2] * min(te - self.t[n - 1], self.horizon)
+
+    def slope(self, te, now):
+        n = self.released(now)
+        if n < 2:
+            return np.zeros(NJ)
+        i = int(np.searchsorted(self.t[:n], te, side="right")) - 1
+        if i < 0:
+            return np.zeros(NJ)
+        if i < n - 1:
+            return self.s[i].copy()
+        if n == len(self.t) or te - self.t[n - 1] > self.horizon:
+            return np.zeros(NJ)
+        return self.s[n - 2].copy()
+
+    def true_at(self, te, j):
+        """The commanded trajectory itself (every action, at its due time) for joint j."""
+        return np.interp(np.asarray(te, float), self.t, self.q[:, j])
+
+    def true_slope(self, te, j):
+        i = np.clip(np.searchsorted(self.t, te, side="right") - 1, 0, len(self.t) - 1)
+        return self.s[i, j]
+
+
+def make_reference(a, js, vlim_all):
+    """Actions (t, q offsets) from --ref-file (CSV: t, q1..q6 in deg, header allowed) or a synthetic
+    smooth motion: 3 sines (0.3, 0.7, 1.3 Hz) per joint with random phases, started and ended at rest."""
+    if a.ref_file:
+        data = np.genfromtxt(a.ref_file, delimiter=",", comments="#")
+        data = data[~np.isnan(data).all(axis=1)] if data.ndim == 2 else data.reshape(1, -1)
+        if np.isnan(data[0]).any():
+            data = data[1:]
+        t = data[:, 0] - data[0, 0]
+        q = np.zeros((len(t), NJ))
+        m = min(NJ, data.shape[1] - 1)
+        q[:, :m] = data[:, 1:1 + m]
+        if not a.ref_relative:
+            q[:, :m] -= q[0, :m]
+        return t, q, os.path.basename(a.ref_file)
+    rng = np.random.default_rng(a.ref_seed)
+    P = a.ref_period_ms * 1e-3
+    t = np.arange(0.0, a.replay_dur + 1e-9, P)
+    q = np.zeros((len(t), NJ))
+    freqs = np.array([0.3, 0.7, 1.3])
+    ramp = np.clip(np.minimum(t, t[-1] - t) / 0.5, 0, 1)
+    win = 0.5 - 0.5 * np.cos(np.pi * ramp)
+    for j in js:
+        A = min(a.ref_amp, 0.5 * vlim_all[j] / (2 * np.pi * freqs.mean()))  # peak speed <= half the limit
+        ph = rng.uniform(0, 2 * np.pi, len(freqs))
+        q[:, j] = win * sum(A / len(freqs) * np.sin(2 * np.pi * f * t + p) for f, p in zip(freqs, ph))
+    return t, q, "synthetic"
+
+
+def policy_effects(t, q, a, js):
+    """What a policy adds to a clean motion: actions published by chunks of --ref-chunk (all known
+    when the chunk's first action is due), a random offset per chunk (--ref-chunk-offset-deg: the
+    jumps seen between chunks), white noise per action (--ref-noise-deg) and a late publication
+    per chunk (exponential, mean --ref-jitter-ms). Returns (q, release times)."""
+    rng = np.random.default_rng(a.ref_seed + 1)
+    n, N = len(t), max(1, int(a.ref_chunk))
+    chunk = np.arange(n) // N
+    nc = int(chunk.max()) + 1
+    q = q.copy()
+    if a.ref_chunk_offset_deg > 0:
+        off = rng.normal(0.0, a.ref_chunk_offset_deg, (nc, NJ))
+        off[0] = 0.0
+        q[:, js] += off[chunk][:, js]
+    if a.ref_noise_deg > 0:
+        q[:, js] += rng.normal(0.0, a.ref_noise_deg, (n, len(js)))
+    jit = rng.exponential(a.ref_jitter_ms * 1e-3, nc) if a.ref_jitter_ms > 0 else np.zeros(nc)
+    release = t[chunk * N] + jit[chunk]
+    return q, release
 
 
 class Tester:
@@ -1118,12 +1229,18 @@ class Tester:
         return out
 
     def _servo_multi_loop(self, A, w, ff, adv, dur):
-        """Same loop as _servo_loop on every joint with A > 0 at once (one MoveJointsVel carries all).
+        """Sine references in phase on every joint with A > 0 (servomulti)."""
+        return self._track_loop(lambda t: A * math.sin(w * t),
+                                (lambda t: A * w * math.cos(w * (t + adv))) if ff else None,
+                                self.args.servo_kp, dur, A > 0)
+
+    def _track_loop(self, ref_fn, ff_fn, kp, dur, active):
+        """Host position loop on the `active` joints at once, every --period:
+        v = kp (ref_fn(t) - y) + ff_fn(t), one MoveJointsVel for all joints. t = loop time [s].
         Log: ts, t_send, t_after, v1..v6, r1..r6, y1..y6, robot_ts and host_rx of the frame used."""
         a, P = self.args, self.args.period
         kind = K_APOS if a.servo_fb == "actual" else K_TPOS
         vmax = 0.95 * self.vlim_all
-        active = A > 0
         q0 = self.start_all.copy()
         i0 = self.rec.n
         log = []
@@ -1138,8 +1255,8 @@ class Tester:
                 y = alljoints(fr, kind)
                 y = np.where(np.isfinite(y), y, alljoints(fr, K_TPOS)) - q0
                 t = k * P
-                r = A * math.sin(w * t)
-                v = a.servo_kp * (r - y) + (A * w * math.cos(w * (t + adv)) if ff else 0.0)
+                r = ref_fn(t)
+                v = kp * (r - y) + (ff_fn(t) if ff_fn else 0.0)
                 v = np.where(active, np.clip(v, -vmax, vmax), 0.0)
                 t1 = time.perf_counter()
                 self.io.send_vel(v)
@@ -1159,7 +1276,81 @@ class Tester:
         log = np.array(log).reshape(-1, 3 + 3 * NJ + 2)
         if len(log):
             self.send_logs.append(np.column_stack([log[:, :3], log[:, 3 + self.j], log[:, 3:3 + NJ]]))
-        return dict(log=log, frames=self.rec.frames(i0), q0=q0, aborted=aborted)
+        return dict(log=log, frames=self.rec.frames(i0), q0=q0, aborted=aborted, t0=t0)
+
+    def _pos_replay(self, R, dur):
+        """Each action as one MoveJoints (blending on), sent when it is both due and released."""
+        a, io = self.args, self.io
+        io.set_joint_vel(a.pos_joint_vel_pct)
+        io.set_blending(a.blending)
+        q0 = self.start_all.copy()
+        i0 = self.rec.n
+        send_at = np.maximum(R.t, R.rel)
+        log = []
+        t0 = time.perf_counter() + 0.01
+        try:
+            for k in range(len(R.t)):
+                ts = t0 + send_at[k]
+                sleep_until(ts)
+                t1 = time.perf_counter()
+                io.move_joints(q0 + R.q[k])
+                t2 = time.perf_counter()
+                log.append(np.concatenate([[ts, t1, t2], R.q[k]]))
+                if k % 5 == 0:
+                    self.guard()
+        except BaseException:
+            io.clear_motion()
+            raise
+        t_last = time.perf_counter()
+        try:
+            io.wait_idle(max(a.pos_backlog_timeout, dur))
+        except Exception as e:  # noqa: BLE001
+            print(f"    queue not drained ({e}) -> ClearMotion")
+            io.clear_motion()
+        time.sleep(0.1)
+        return dict(log=np.array(log).reshape(-1, 3 + NJ), frames=self.rec.frames(i0), q0=q0, aborted=False,
+                    t0=t0, t_last=t_last)
+
+    def run_replay(self):
+        """Replay a 6-joint action stream (CSV --ref-file, or synthetic policy-like actions) through
+        --replay-modes: vel = host loop + feedforward, ff = feedforward only, pos = MoveJoints stream."""
+        a = self.args
+        js = sorted({j - 1 for j in a.multi_joints})
+        t, q, src = make_reference(a, js, self.vlim_all)
+        q, release = policy_effects(t, q, a, js)
+        peak = float(np.nanmax(np.abs(q)))
+        if peak > 0.8 * a.max_excursion:
+            raise SafetyStop(f"replay reference reaches {peak:.1f} deg from start (> 80 % of --max-excursion)")
+        P_act = float(np.median(np.diff(t)))
+        adv = a.servo_adv_ms * 1e-3 if a.servo_adv_ms is not None else self.model_delay()
+        R = ActionRef(t, q, release, horizon=max(2 * P_act, adv + 2 * a.period))
+        active = np.zeros(NJ, bool)
+        active[js] = True
+        out = dict(joints=js, t=t, q=q, release=release, source=src, P_action=P_act, chunk=a.ref_chunk,
+                   noise_deg=a.ref_noise_deg, jitter_ms=a.ref_jitter_ms, chunk_offset_deg=a.ref_chunk_offset_deg,
+                   kp=a.servo_kp, adv=adv, P=a.period, vmax=0.95 * self.vlim_all, fb=a.servo_fb,
+                   settle=a.replay_settle, runs=[])
+        dur = float(t[-1]) + 0.5
+        print(f"  {src} reference: {len(t)} actions every {P_act * 1e3:.0f} ms on J"
+              f"{', J'.join(str(j + 1) for j in js)}, chunks of {a.ref_chunk}, noise {a.ref_noise_deg:g} deg, "
+              f"jitter {a.ref_jitter_ms:g} ms, chunk offset {a.ref_chunk_offset_deg:g} deg, peak {peak:.2f} deg")
+        for mode in a.replay_modes:
+            if mode in ("vel", "ff"):
+                kp = a.servo_kp if mode == "vel" else 0.0
+                print(f"  replay through MoveJointsVel: " + (f"Kp {kp:g} + feedforward {adv * 1e3:.1f} ms ahead"
+                                                            if kp else f"feedforward only, {adv * 1e3:.1f} ms ahead"))
+                res = self._track_loop(lambda tt: R.at(tt, tt), lambda tt: R.slope(tt + adv, tt), kp, dur, active)
+            elif mode == "pos":
+                print(f"  replay through MoveJoints (blending {a.blending:g} %, SetJointVel {a.pos_joint_vel_pct:g} %)")
+                res = self._pos_replay(R, dur)
+            else:
+                print(f"  unknown replay mode '{mode}', skipped")
+                continue
+            out["runs"].append(dict(mode=mode, **res))
+            self.home()
+            if res["aborted"]:
+                break
+        return out
 
     def run_servomulti(self):
         """Host position loop on all --multi-joints at once: sine references in phase, with and
@@ -1825,6 +2016,110 @@ def analyze_vmaxcheck(res, cmap):
                          vmax_measured=(v / (r["pct"] / 100)) if clamped else math.nan))
     res["rows"] = rows
     return rows
+
+
+def _best_shift(tt, y, R, j):
+    """Delay d minimising RMS(y(t) - ref(t - d)): coarse 1 ms grid then 0.1 ms."""
+    def rms_at(d):
+        return float(np.sqrt(np.mean((y - R.true_at(tt - d, j)) ** 2)))
+    grid = np.arange(-0.02, 0.2001, 0.001)
+    d0 = grid[int(np.argmin([rms_at(d) for d in grid]))]
+    fine = np.arange(d0 - 0.001, d0 + 0.0011, 0.0001)
+    errs = [rms_at(d) for d in fine]
+    k = int(np.argmin(errs))
+    return float(fine[k]), errs[k]
+
+
+def analyze_replay(res, cmap):
+    """Per interface (mode) and joint, against the commanded trajectory (actions at their due time):
+    RMS / max error, delay (best time shift) and the error left once that delay is removed, target
+    acceleration RMS and stall % (smoothness), saturation and queue backlog."""
+    R = ActionRef(res["t"], res["q"], res["release"], horizon=0.0)
+    js, settle, t_end = res["joints"], res["settle"], float(res["t"][-1])
+    rows = []
+    for run in res["runs"]:
+        fr, L = run["frames"], run["log"]
+        if len(fr) < 50 or len(L) < 5:
+            continue
+        tm = cmap(fr[:, ROBOT])
+        tt = tm - run["t0"]
+        run["tt"] = tt
+        w = (tt >= settle) & (tt <= t_end - 0.2)
+        for j in js:
+            ap = fr[:, col(K_APOS, j)]
+            y = (ap if np.isfinite(ap).any() else fr[:, col(K_TPOS, j)]) - run["q0"][j]
+            ok = w & np.isfinite(y)
+            if ok.sum() < 50:
+                continue
+            ref = R.true_at(tt[ok], j)
+            e = y[ok] - ref
+            ref_rms = float(np.std(ref)) or math.nan
+            d, shape = _best_shift(tt[ok], y[ok], R, j)
+            tv = fr[ok, col(K_TVEL, j)]
+            acc = np.gradient(tv, tm[ok]) if np.isfinite(tv).sum() > 10 else np.full(tv.shape, math.nan)
+            rs = np.abs(R.true_slope(tt[ok] - d, j))
+            fast = rs > 0.5 * np.max(rs) if np.max(rs) > 0 else np.zeros(rs.shape, bool)
+            row = dict(mode=run["mode"], joint=j + 1, ref_rms_deg=ref_rms,
+                       rms_err_deg=float(np.sqrt(np.mean(e ** 2))), max_err_deg=float(np.max(np.abs(e))),
+                       rel_err_pct=100 * float(np.sqrt(np.mean(e ** 2))) / ref_rms, delay_ms=d * 1e3,
+                       shape_err_deg=shape, shape_rel_pct=100 * shape / ref_rms,
+                       accel_rms=float(np.sqrt(np.nanmean(acc ** 2))),
+                       stall_pct=100 * float(np.mean(np.abs(tv[fast]) < 0.1 * np.max(rs))) if fast.any() else math.nan)
+            if run["mode"] in ("vel", "ff"):
+                row["sat_pct"] = 100 * float(np.mean(np.abs(L[:, 3 + j]) >= 0.999 * res["vmax"][j]))
+            if run["mode"] == "pos":  # target still moving after the last MoveJoints was sent
+                tv_all = fr[:, col(K_TVEL, j)]
+                mv = np.isfinite(tv_all) & (np.abs(tv_all) > 0.2)
+                row["backlog_ms"] = (float(tm[np.nonzero(mv)[0][-1]]) - run["t_last"]) * 1e3 if mv.any() else math.nan
+            rows.append(row)
+    res["rows"] = rows
+    modes = list(dict.fromkeys(r["mode"] for r in rows))
+    per_mode = [dict(mode=mo, **{k: nmed([r.get(k) for r in rows if r["mode"] == mo])
+                                 for k in ("rel_err_pct", "rms_err_deg", "max_err_deg", "delay_ms", "shape_rel_pct",
+                                           "accel_rms", "stall_pct", "sat_pct", "backlog_ms")}) for mo in modes]
+    return dict(source=res["source"], P_action_ms=res["P_action"] * 1e3, chunk=res["chunk"],
+                noise_deg=res["noise_deg"], jitter_ms=res["jitter_ms"], chunk_offset_deg=res["chunk_offset_deg"],
+                kp=res["kp"], feedforward_advance_ms=res["adv"] * 1e3, joints=[j + 1 for j in js],
+                per_mode=per_mode, rows=rows)
+
+
+def plot_replay(res, summ, out, plt):
+    rows = summ.get("rows") or []
+    if not rows:
+        return
+    R = ActionRef(res["t"], res["q"], res["release"], horizon=0.0)
+    js = res["joints"]
+    jb = max(js, key=lambda j: float(np.std(res["q"][:, j])))
+    fig, axs = plt.subplots(1, 3, figsize=(20, 5))
+    ta = res["settle"]
+    tb = min(ta + 3.0, float(res["t"][-1]))
+    tg = np.linspace(ta, tb, 1500)
+    axs[0].plot(tg, R.true_at(tg, jb), "k", lw=1.2, label="commanded (actions at due time)")
+    for i, run in enumerate(r for r in res["runs"] if "tt" in r):
+        fr, tt = run["frames"], run["tt"]
+        sel = (tt >= ta) & (tt <= tb)
+        ap = fr[sel, col(K_APOS, jb)]
+        axs[0].plot(tt[sel], ap - run["q0"][jb], color=f"C{i}", lw=1, label=f"actual, {run['mode']}")
+    axs[0].set(xlabel="s", ylabel="deg", title=f"J{jb + 1}: commanded vs actual (3 s)")
+    modes = list(dict.fromkeys(r["mode"] for r in rows))
+    joints = sorted({r["joint"] for r in rows})
+    x = np.arange(len(joints))
+    wd = 0.8 / max(1, len(modes))
+    for i, mo in enumerate(modes):
+        rr = {r["joint"]: r for r in rows if r["mode"] == mo}
+        xs = x - 0.4 + wd * (i + 0.5)
+        axs[1].bar(xs, [rr[j]["rel_err_pct"] if j in rr else math.nan for j in joints], wd, color=f"C{i}", label=mo)
+        axs[1].plot(xs, [rr[j]["shape_rel_pct"] if j in rr else math.nan for j in joints], "k_", ms=10, mew=2)
+        axs[2].bar(xs, [rr[j]["delay_ms"] if j in rr else math.nan for j in joints], wd, color=f"C{i}", label=mo)
+    for ax in axs[1:]:
+        ax.set_xticks(x); ax.set_xticklabels([f"J{j}" for j in joints]); ax.grid(alpha=.3, axis="y"); ax.legend(fontsize=8)
+    axs[1].set(ylabel="% of the reference RMS", title="Tracking error (bars) and error once delayed (black)")
+    axs[2].set(ylabel="ms", title="Delay behind the commanded trajectory")
+    axs[0].grid(alpha=.3); axs[0].legend(fontsize=8)
+    sub = (f"{summ['source']} actions every {summ['P_action_ms']:.0f} ms, chunks of {summ['chunk']}, "
+           f"noise {summ['noise_deg']:g} deg, jitter {summ['jitter_ms']:g} ms, chunk offset {summ['chunk_offset_deg']:g} deg")
+    fig.suptitle(sub, fontsize=10)
+    _save(fig, out, "18_replay.png", plt)
 
 
 def analyze_periodsweep(res, cmap):
@@ -2567,9 +2862,12 @@ def parse_args(argv=None):
     p.add_argument("--max-excursion", type=float, default=45, help="abort beyond this many deg from start")
     p.add_argument("--repeats", type=int, default=5)
     p.add_argument("--rt-reader", choices=("callback", "poll"), default="callback",
-                   help="how real-time frames are read: mecademicpy end-of-cycle callback, or a polling thread")
+                   help="how real-time frames are read: mecademicpy end-of-cycle callback (recommended), or a "
+                        "polling thread (2026-11-25: loses 38 %% of frames instead of 16 %%, and with "
+                        "--high-priority it stalled the control loop for 48 ms)")
     p.add_argument("--high-priority", action="store_true",
-                   help="HIGH process priority + 1 ms timer resolution (Windows), nice -10 elsewhere")
+                   help="HIGH process priority + 1 ms timer resolution (Windows), nice -10 elsewhere; "
+                        "recommended with the callback reader (lower feedback age and send spikes)")
     p.add_argument("--joint-vmax", type=fl, default=None,
                    help="joint speed limits at 100 %% [deg/s], 6 values; overrides the R3 values (see vmaxcheck)")
     g = p.add_argument_group("velocity tests")
@@ -2621,6 +2919,24 @@ def parse_args(argv=None):
     g.add_argument("--servo-abort", type=float, default=10.0, help="stop a run if |error| exceeds this [deg]")
     g.add_argument("--servomulti-freqs", type=fl, default=fl("1,3,5"),
                    help="servomulti sine frequencies [Hz] (joints = --multi-joints)")
+    g = p.add_argument_group("replay (policy-like action streams, joints = --multi-joints)")
+    g.add_argument("--replay-modes", type=lambda s: [x.strip() for x in s.split(",") if x.strip()],
+                   default=["vel", "ff", "pos"],
+                   help="interfaces: vel = host loop (Kp --servo-kp) + feedforward, ff = feedforward only, "
+                        "pos = one MoveJoints per action with blending")
+    g.add_argument("--ref-file", default=None,
+                   help="CSV of actions: t [s], q1..q6 [deg] (header allowed); default: synthetic motion")
+    g.add_argument("--ref-absolute", dest="ref_relative", action="store_false",
+                   help="--ref-file holds absolute joint angles (its first row becomes the start pose offset)")
+    g.add_argument("--ref-period-ms", type=float, default=20.0, help="synthetic action period [ms] (50 Hz)")
+    g.add_argument("--ref-amp", type=float, default=5.0, help="synthetic amplitude per joint [deg] (capped by speed)")
+    g.add_argument("--replay-dur", type=float, default=8.0, help="synthetic duration [s]")
+    g.add_argument("--ref-chunk", type=int, default=1, help="actions published by chunks of N (1 = streaming)")
+    g.add_argument("--ref-chunk-offset-deg", type=float, default=0.0, help="random jump between chunks [deg]")
+    g.add_argument("--ref-noise-deg", type=float, default=0.0, help="white noise per action [deg]")
+    g.add_argument("--ref-jitter-ms", type=float, default=0.0, help="mean late publication per chunk [ms]")
+    g.add_argument("--ref-seed", type=int, default=0, help="random seed of the synthetic actions")
+    g.add_argument("--replay-settle", type=float, default=0.5, help="start of the analysis window [s]")
     g.add_argument("--model-tau", type=float, default=None, help="model delay for predictions [ms] (no step test)")
     g.add_argument("--model-T", type=float, default=None, help="model moving average [ms] (no step test)")
     p.add_argument("--out", default=None, help="output folder")
@@ -2802,6 +3118,17 @@ def print_summary(S):
             print(f"  sine {s['f']:5.2f} Hz {'FF' if s['ff'] else '  '} | gain {s['gain']:6.3f} (model "
                   f"{s['model_gain']:6.3f}) | phase {s['phase_deg']:7.1f} (model {s['model_phase_deg']:7.1f}) deg | "
                   f"error rms {s['err_rms_pct']:6.1f} % | sat {s['sat_pct']:.0f} %")
+    if S.get("replay"):
+        x = S["replay"]
+        print(f"\nREPLAY ({x['source']} actions every {x['P_action_ms']:.0f} ms on J{', J'.join(str(j) for j in x['joints'])}, "
+              f"chunks of {x['chunk']}, noise {x['noise_deg']:g} deg, jitter {x['jitter_ms']:g} ms, chunk offset "
+              f"{x['chunk_offset_deg']:g} deg; vel: Kp {x['kp']:g}, feedforward {x['feedforward_advance_ms']:.1f} ms ahead)")
+        print("  mode | error % of ref (median over joints) | delay ms | error once delayed % | max err deg | "
+              "accel rms deg/s2 | stall % | sat % | backlog ms")
+        for r in x["per_mode"]:
+            print(f"  {r['mode']:4s} | {_f(r['rel_err_pct'], '6.1f')} | {_f(r['delay_ms'], '6.1f')} | "
+                  f"{_f(r['shape_rel_pct'], '6.1f')} | {_f(r['max_err_deg'], '6.3f')} | {_f(r['accel_rms'], '7.0f')} | "
+                  f"{_f(r['stall_pct'], '5.1f')} | {_f(r['sat_pct'], '5.1f')} | {_f(r['backlog_ms'], '6.1f')}")
     if "external_loop_prediction" in S:
         x = S["external_loop_prediction"]
         print(f"\nPREDICTED HOST POSITION LOOP (P controller via MoveJointsVel; model from {x['model_source']})")
@@ -2879,6 +3206,8 @@ def analyze_all(raw, frames, send_logs, args, out, plt):
     if "servomulti" in raw and raw["servomulti"]["runs"]:
         run("servomulti", lambda: analyze_servomulti(raw["servomulti"], cmap, mdl),
             lambda r: plot_servomulti(raw["servomulti"], r, out, plt))
+    if "replay" in raw and raw["replay"]["runs"]:
+        run("replay", lambda: analyze_replay(raw["replay"], cmap), lambda r: plot_replay(raw["replay"], r, out, plt))
     run("external_loop_prediction", lambda: predict_external_loop(S, args, mdl))
     S["robot_info"] = raw.get("_robot_info")
     S["config"] = {k: v for k, v in vars(args).items()}
