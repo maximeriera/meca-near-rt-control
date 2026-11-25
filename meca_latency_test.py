@@ -59,7 +59,14 @@ Tests (--tests: comma separated names and/or groups vel, pos, servo, all)
               through --replay-modes vel (loop + feedforward), ff (feedforward only), pos (one MoveJoints
               per action), posi (MoveJoints every --pos-interp-ms to the host-interpolated position):
               error, delay, error once delayed, smoothness, backlog. --ref-predict quad extrapolates
-              with the last change of slope.
+              with the last change of slope. --ref-smooth N tracks the actions through a centred
+              Savitzky-Golay filter; with noise or chunk offsets the error is also given against the
+              clean motion, and the acceleration against the clean motion's.
+ Worst cases (teleoperation)
+  soak        the host loop on --multi-joints for --soak-dur s per --soak-loads (idle, cpu = busy
+              processes, gil = busy Python thread in this process): tails (p99, p99.9, max) of feedback
+              age, send interval, frame gaps, missing frames. Long: not part of 'all'. netcap.py compares
+              a packet capture of the monitoring port with the frames of a run.
  External sensor
   sensorsweep the host loop through an emulated sensor (--sensor-rates x --sensor-delays, Kp from
               the model for --sensor-pm): step + sines vs the model. --fb-delay-ms / --fb-rate-hz /
@@ -95,6 +102,7 @@ import json
 import math
 import os
 import pickle
+import subprocess
 import sys
 import threading
 import time
@@ -815,6 +823,69 @@ def policy_effects(t, q, a, js):
     return q, release
 
 
+def smooth_actions(q, release, n_win, js):
+    """What a host can do with noisy actions before tracking them: a centred Savitzky-Golay filter
+    over n_win actions (made odd; order 2, order 1 = moving average for 3). The smoothed action k
+    needs the raw actions up to k + n_win // 2, so it is only released when they are: free when
+    chunks are published ahead, a delay of n_win // 2 actions on a just-in-time stream.
+    Returns (q, release, half window); unchanged below 3 actions."""
+    h = int(n_win or 0) // 2
+    n = len(q)
+    if h < 1 or n < 2 * h + 1:
+        return q, np.asarray(release, float), 0
+    from scipy.signal import savgol_filter
+    qs = np.array(q, float)
+    qs[:, js] = savgol_filter(qs[:, js], 2 * h + 1, 1 if h == 1 else 2, axis=0, mode="interp")
+    rel = np.asarray(release, float)[np.minimum(np.arange(n) + h, n - 1)]
+    return qs, rel, h
+
+
+class LoadGen:
+    """Background load of the soak test, as a context manager. 'idle': none. 'cpu': busy processes
+    (one per logical core by default) at normal priority, like other programs on the PC. 'gil': a busy
+    pure-Python thread in this process, like a policy's Python code running next to the control loop
+    (it competes for the interpreter lock, not only for the CPU)."""
+    KINDS = ("idle", "cpu", "gil")
+
+    def __init__(self, kind, procs=0, max_s=600.0):
+        if kind not in self.KINDS:
+            raise ValueError(f"unknown soak load '{kind}' (one of {', '.join(self.KINDS)})")
+        self.kind, self.procs = kind, int(procs) or (os.cpu_count() or 2)
+        self.max_s = float(max_s)  # the busy processes stop by themselves after this, even if we die
+        self._procs, self._stop, self._thread = [], threading.Event(), None
+
+    def _burn(self):
+        x = 0
+        while not self._stop.is_set():
+            x += 1
+
+    def __enter__(self):
+        if self.kind == "cpu":
+            flags = getattr(subprocess, "NORMAL_PRIORITY_CLASS", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            code = f"import time\nt = time.perf_counter() + {self.max_s}\nwhile time.perf_counter() < t: pass"
+            self._procs = [subprocess.Popen([sys.executable, "-c", code], creationflags=flags)
+                           for _ in range(self.procs)]
+        elif self.kind == "gil":
+            self._thread = threading.Thread(target=self._burn, daemon=True)
+            self._thread.start()
+        if self.kind != "idle":
+            time.sleep(0.5)  # let the load settle
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        for p in self._procs:
+            p.kill()
+        for p in self._procs:
+            try:
+                p.wait(5)
+            except Exception:  # noqa: BLE001
+                pass
+        if self._thread:
+            self._thread.join(2)
+        return False
+
+
 class Tester:
     def __init__(self, io, rec: Recorder, args):
         self.io, self.rec, self.args = io, rec, args
@@ -1326,11 +1397,12 @@ class Tester:
                                 (lambda t: A * w * math.cos(w * (t + adv))) if ff else None,
                                 self.args.servo_kp, dur, A > 0)
 
-    def _track_loop(self, ref_fn, ff_fn, kp, dur, active, sensor=None):
+    def _track_loop(self, ref_fn, ff_fn, kp, dur, active, sensor=None, keep_frames=True):
         """Host position loop on the `active` joints at once, every --period:
         v = kp (ref_fn(t) - y) + ff_fn(t), one MoveJointsVel for all joints. t = loop time [s].
         The positions go through `sensor` (default: --fb-* options).
-        Log: ts, t_send, t_after, v1..v6, r1..r6, y1..y6, robot_ts and host_rx of the frame used."""
+        Log: ts, t_send, t_after, v1..v6, r1..r6, y1..y6, robot_ts and host_rx of the frame used.
+        keep_frames=False (long runs): no copy of the frames, only their range i0:i1 in the recorder."""
         a, P = self.args, self.args.period
         kind = K_APOS if a.servo_fb == "actual" else K_TPOS
         vmax = 0.95 * self.vlim_all
@@ -1371,6 +1443,8 @@ class Tester:
         log = np.array(log).reshape(-1, 3 + 3 * NJ + 2)
         if len(log):
             self.send_logs.append(np.column_stack([log[:, :3], log[:, 3 + self.j], log[:, 3:3 + NJ]]))
+        if not keep_frames:
+            return dict(log=log, i0=i0, i1=self.rec.n, q0=q0, aborted=aborted, t0=t0)
         return dict(log=log, frames=self.rec.frames(i0), q0=q0, aborted=aborted, t0=t0)
 
     def _pos_replay(self, R, dur):
@@ -1411,8 +1485,9 @@ class Tester:
         --replay-modes: vel = host loop + feedforward, ff = feedforward only, pos = MoveJoints stream."""
         a = self.args
         js = sorted({j - 1 for j in a.multi_joints})
-        t, q, src = make_reference(a, js, self.vlim_all)
-        q, release = policy_effects(t, q, a, js)
+        t, q_clean, src = make_reference(a, js, self.vlim_all)
+        q, release = policy_effects(t, q_clean, a, js)
+        q_cmd, rel_cmd, h_smooth = smooth_actions(q, release, a.ref_smooth, js)
         peak = float(np.nanmax(np.abs(q)))
         if peak > 0.8 * a.max_excursion:
             raise SafetyStop(f"replay reference reaches {peak:.1f} deg from start (> 80 % of --max-excursion)")
@@ -1420,11 +1495,13 @@ class Tester:
         adv = a.servo_adv_ms * 1e-3 if a.servo_adv_ms is not None else self.model_delay()
         Pi = a.pos_interp_ms * 1e-3
         adv_pos = a.posi_adv_ms * 1e-3 if a.posi_adv_ms is not None else self.model_delay() - a.period / 2 + Pi / 2
-        R = ActionRef(t, q, release, horizon=max(2 * P_act, adv + 2 * a.period, adv_pos + 2 * Pi),
+        # the controller tracks the smoothed actions (the raw ones without --ref-smooth)
+        R = ActionRef(t, q_cmd, rel_cmd, horizon=max(2 * P_act, adv + 2 * a.period, adv_pos + 2 * Pi) + h_smooth * P_act,
                       order=2 if a.ref_predict == "quad" else 1)
         active = np.zeros(NJ, bool)
         active[js] = True
-        out = dict(joints=js, t=t, q=q, release=release, source=src, P_action=P_act, chunk=a.ref_chunk,
+        out = dict(joints=js, t=t, q=q, release=release, q_clean=q_clean, smooth=2 * h_smooth + 1 if h_smooth else 0,
+                   source=src, P_action=P_act, chunk=a.ref_chunk,
                    noise_deg=a.ref_noise_deg, jitter_ms=a.ref_jitter_ms, chunk_offset_deg=a.ref_chunk_offset_deg,
                    lead_ms=a.ref_lead_ms, predict=a.ref_predict, posi_period=Pi, posi_adv=adv_pos,
                    kp=a.servo_kp, adv=adv, P=a.period, vmax=0.95 * self.vlim_all, fb=a.servo_fb,
@@ -1432,7 +1509,8 @@ class Tester:
         dur = float(t[-1]) + 0.5
         print(f"  {src} reference: {len(t)} actions every {P_act * 1e3:.0f} ms on J"
               f"{', J'.join(str(j + 1) for j in js)}, chunks of {a.ref_chunk}, noise {a.ref_noise_deg:g} deg, "
-              f"jitter {a.ref_jitter_ms:g} ms, chunk offset {a.ref_chunk_offset_deg:g} deg, peak {peak:.2f} deg")
+              f"jitter {a.ref_jitter_ms:g} ms, chunk offset {a.ref_chunk_offset_deg:g} deg, peak {peak:.2f} deg"
+              + (f", smoothed over {2 * h_smooth + 1} actions" if h_smooth else ""))
         for mode in a.replay_modes:
             if mode in ("vel", "ff"):
                 kp = a.servo_kp if mode == "vel" else 0.0
@@ -1645,6 +1723,46 @@ class Tester:
                 self.home()
                 if res["aborted"]:
                     return out
+        return out
+
+    def run_soak(self):
+        """Worst cases for teleoperation: the host loop (Kp --servo-kp + feedforward) on all
+        --multi-joints for --soak-dur s under each --soak-loads, tracking a slow random-looking motion
+        (3 sines per joint, --soak-amp). The analysis looks at the tails, not the medians."""
+        a = self.args
+        js = sorted({j - 1 for j in a.multi_joints})
+        active = np.zeros(NJ, bool)
+        active[js] = True
+        vmax = 0.95 * self.vlim_all
+        adv = a.servo_adv_ms * 1e-3 if a.servo_adv_ms is not None else self.model_delay()
+        freqs = np.array([0.2, 0.45, 0.9])
+        ph = np.random.default_rng(a.ref_seed).uniform(0, 2 * np.pi, (NJ, len(freqs)))
+        A = np.zeros(NJ)
+        A[js] = np.minimum(a.soak_amp, 0.5 * vmax[js] / (2 * np.pi * freqs.mean()))
+        dur = float(a.soak_dur)
+
+        def ref(t):
+            w = min(max(min(t, dur - t) / 0.5, 0.0), 1.0)          # 0.5 s smooth start and stop
+            w = 0.5 - 0.5 * math.cos(math.pi * w)
+            return w * (A / len(freqs)) * np.sin(2 * np.pi * freqs * t + ph).sum(axis=1)
+
+        def dref(t, h=1e-3):
+            return (ref(t + adv + h) - ref(t + adv - h)) / (2 * h)
+
+        out = dict(joints=js, A=A, freqs=freqs, kp=a.servo_kp, adv=adv, P=a.period, vmax=vmax, fb=a.servo_fb,
+                   dur=dur, vel_timeout=a.vel_timeout, phases=[])
+        for load in a.soak_loads:
+            gen = LoadGen(load, a.stress_procs, max_s=dur + 60)
+            print(f"  soak {dur:g} s, load '{load}'" + (f" ({gen.procs} busy processes)" if load == "cpu" else "")
+                  + f": J{', J'.join(str(j + 1) for j in js)}, A {', '.join(f'{A[j]:.2f}' for j in js)} deg, "
+                  f"Kp {a.servo_kp:g}, feedforward {adv * 1e3:.1f} ms")
+            with gen:
+                res = self._track_loop(ref, dref, a.servo_kp, dur, active, keep_frames=False)
+            out["phases"].append(dict(load=load, procs=gen.procs if load == "cpu" else 0, **res))
+            self.home()
+            if res["aborted"]:
+                print("    soak stopped (error above --servo-abort)")
+                break
         return out
 
 
@@ -2307,6 +2425,10 @@ def analyze_replay(res, cmap):
     acceleration RMS and stall % (smoothness), saturation and queue backlog."""
     R = ActionRef(res["t"], res["q"], res["release"], horizon=0.0)
     js, settle, t_end = res["joints"], res["settle"], float(res["t"][-1])
+    # runs since 2026-11-25 evening keep the motion before noise / chunk offsets: what the policy meant
+    Rc = ActionRef(res["t"], res["q_clean"], res["release"], horizon=0.0) if "q_clean" in res else None
+    ta_ = np.asarray(res["t"], float)
+    win_a = (ta_ >= settle) & (ta_ <= t_end - 0.2)
     rows = []
     for run in res["runs"]:
         fr, L = run["frames"], run["log"]
@@ -2344,19 +2466,131 @@ def analyze_replay(res, cmap):
                 ch = np.nonzero(np.abs(np.diff(L[:, 3 + j])) > 1e-9)[0]
                 t_cmd = L[ch[-1] + 1, 1] if len(ch) else run["t_last"]
                 row["backlog_ms"] = (float(tm[np.nonzero(mv)[0][-1]]) - t_cmd) * 1e3 if mv.any() else math.nan
+            if Rc is not None:  # against the clean motion: how much of the noise / offsets reached the robot
+                refc = Rc.true_at(tt[ok], j)
+                c_rms = float(np.std(refc)) or math.nan
+                dc, shc = _best_shift(tt[ok], y[ok], Rc, j)
+                qc = res["q_clean"][:, j]
+                acc_c = np.gradient(np.gradient(qc, ta_), ta_)[win_a]
+                ref_acc = float(np.sqrt(np.mean(acc_c ** 2))) if acc_c.size else math.nan
+                row.update(clean_rel_err_pct=100 * float(np.sqrt(np.mean((y[ok] - refc) ** 2))) / c_rms,
+                           clean_delay_ms=dc * 1e3, clean_shape_rel_pct=100 * shc / c_rms,
+                           input_dev_pct=100 * float(np.std((res["q"][:, j] - qc)[win_a])) / c_rms,
+                           ref_accel_rms=ref_acc, accel_ratio=row["accel_rms"] / ref_acc if ref_acc else math.nan)
             rows.append(row)
     res["rows"] = rows
     modes = list(dict.fromkeys(r["mode"] for r in rows))
+    keys = ["rel_err_pct", "rms_err_deg", "max_err_deg", "delay_ms", "shape_rel_pct", "accel_rms", "stall_pct",
+            "sat_pct", "backlog_ms"]
+    if Rc is not None:
+        keys += ["clean_rel_err_pct", "clean_delay_ms", "clean_shape_rel_pct", "input_dev_pct", "accel_ratio"]
     per_mode = [dict(mode=mo, aborted=any(r["aborted"] for r in rows if r["mode"] == mo),
-                     **{k: nmed([r.get(k) for r in rows if r["mode"] == mo])
-                                 for k in ("rel_err_pct", "rms_err_deg", "max_err_deg", "delay_ms", "shape_rel_pct",
-                                           "accel_rms", "stall_pct", "sat_pct", "backlog_ms")}) for mo in modes]
-    return dict(source=res["source"], P_action_ms=res["P_action"] * 1e3, chunk=res["chunk"],
+                     **{k: nmed([r.get(k) for r in rows if r["mode"] == mo]) for k in keys}) for mo in modes]
+    return dict(source=res["source"], P_action_ms=res["P_action"] * 1e3, chunk=res["chunk"], smooth=res.get("smooth", 0),
                 noise_deg=res["noise_deg"], jitter_ms=res["jitter_ms"], chunk_offset_deg=res["chunk_offset_deg"],
                 lead_ms=res.get("lead_ms", 0.0), predict=res.get("predict", "linear"),
                 posi_period_ms=res.get("posi_period", math.nan) * 1e3, posi_advance_ms=res.get("posi_adv", math.nan) * 1e3,
                 kp=res["kp"], feedforward_advance_ms=res["adv"] * 1e3, joints=[j + 1 for j in js],
                 per_mode=per_mode, rows=rows)
+
+
+def tail(x, scale=1.0):
+    """Median and tail of a timing signal: p99, p99.9, max."""
+    x = np.asarray(x, float).ravel()
+    x = x[np.isfinite(x)] * scale
+    if x.size == 0:
+        return None
+    return dict(n=int(x.size), median=float(np.median(x)), p99=float(np.percentile(x, 99)),
+                p999=float(np.percentile(x, 99.9)), max=float(x.max()))
+
+
+def _soak_signals(ph, frames, cmap):
+    """Per tick and per frame timing signals of one soak phase [s]."""
+    L = ph["log"]
+    t1, rts = L[:, 1], L[:, 3 + 3 * NJ]
+    fresh = np.r_[True, np.diff(rts) != 0]
+    fr = frames[ph["i0"]:ph["i1"]]
+    return dict(t=t1 - t1[0], age=t1 - cmap(rts), late=t1 - L[:, 0], call=L[:, 2] - t1, send_gap=np.diff(t1),
+                fresh=fresh, host_gap=np.diff(fr[:, HOST]), robot_gap=np.diff(fr[:, ROBOT]),
+                transport=fr[:, HOST] - cmap(fr[:, ROBOT]))
+
+
+def analyze_soak(res, frames, cmap, mdl):
+    """Per load: tails of the feedback age at the moment a command is sent, of the send interval and
+    lateness, of the gaps between frames received; missing frames; ticks without new feedback;
+    tracking error; and the crossover the model allows (60 deg of phase margin) if the loop is
+    designed for the median feedback age or for its p99.9."""
+    js = res["joints"]
+    m = dict(tau=mdl["tau"], T=mdl["T"], P=res["P"], tau_s=mdl["tau_s"], fb_actual=res["fb"] == "actual")
+    rows = []
+    for ph in res["phases"]:
+        L = ph["log"]
+        if len(L) < 100:
+            continue
+        s = _soak_signals(ph, frames, cmap)
+        rg = s["robot_gap"]
+        k = np.maximum(1, np.round(rg / np.median(rg))) if rg.size else np.ones(1)
+        idx = np.nonzero(s["fresh"])[0]
+        no_fb = np.diff(L[idx, 1]) if len(idx) > 1 else np.zeros(1)
+        e = L[:, 3 + 2 * NJ + np.array(js)] - L[:, 3 + NJ + np.array(js)]
+        age = tail(s["age"], 1e3)
+        to = res.get("vel_timeout", 0.05)
+        row = dict(load=ph["load"], procs=ph.get("procs", 0), dur_s=float(s["t"][-1]), ticks=len(L),
+                   loop_hz=float((len(L) - 1) / s["t"][-1]) if s["t"][-1] > 0 else math.nan, aborted=bool(ph["aborted"]),
+                   fb_age_ms=age, send_interval_ms=tail(s["send_gap"], 1e3), send_late_ms=tail(s["late"], 1e3),
+                   call_ms=tail(s["call"], 1e3), host_rx_gap_ms=tail(s["host_gap"], 1e3),
+                   transport_ms=tail(s["transport"], 1e3),
+                   missing_frames_pct=float(100 * np.sum(k - 1) / max(1.0, np.sum(k))),
+                   stale_ticks_pct=100 * float(np.mean(~s["fresh"])), longest_no_feedback_ms=float(no_fb.max() * 1e3),
+                   n_fb_age_over_10ms=int(np.sum(s["age"] > 0.010)), n_fb_age_over_20ms=int(np.sum(s["age"] > 0.020)),
+                   n_fb_age_over_50ms=int(np.sum(s["age"] > 0.050)),
+                   n_send_gap_over_vel_timeout=int(np.sum(s["send_gap"] > to)),
+                   err_rms_deg=float(np.max(np.sqrt(np.nanmean(e ** 2, axis=0)))), err_max_deg=float(np.nanmax(np.abs(e))))
+        if age:
+            row["fc60_hz_median_age"] = kp_for_pm(60, dict(m, tau_b=age["median"] * 1e-3))["fc_hz"]
+            row["fc60_hz_p999_age"] = kp_for_pm(60, dict(m, tau_b=age["p999"] * 1e-3))["fc_hz"]
+        rows.append(row)
+    res["rows"] = rows
+    return dict(joints=[j + 1 for j in js], kp=res["kp"], feedforward_advance_ms=res["adv"] * 1e3, P_ms=res["P"] * 1e3,
+                dur_s=res["dur"], model=dict(tau_ms=m["tau"] * 1e3, T_ms=m["T"] * 1e3, servo_lag_ms=m["tau_s"] * 1e3,
+                                             source=mdl["src"]), phases=rows)
+
+
+def plot_soak(res, summ, frames, cmap, out, plt):
+    """Feedback age over time (max per second) and the share of ticks / frames above each value."""
+    phases = [p for p in res["phases"] if len(p["log"]) >= 100]
+    if not phases:
+        return
+    fig, axs = plt.subplots(2, 2, figsize=(15, 9))
+    t_off = 0.0
+    for i, ph in enumerate(phases):
+        s = _soak_signals(ph, frames, cmap)
+        c, lab = f"C{i}", ph["load"]
+        sec = np.floor(s["t"]).astype(int)
+        full = sec < int(s["t"][-1])                 # whole seconds only
+        mx = np.full(max(1, int(s["t"][-1])), np.nan)
+        np.fmax.at(mx, sec[full], s["age"][full] * 1e3)
+        axs[0, 0].plot(t_off + np.arange(len(mx)), mx, color=c, lw=1, label=f"{lab}: max per second")
+        t_off += len(mx) + 2
+        for ax, x in ((axs[0, 1], s["age"]), (axs[1, 0], s["send_gap"]), (axs[1, 1], s["host_gap"])):
+            x = np.sort(x[np.isfinite(x)]) * 1e3
+            if x.size:
+                ax.step(x, 1.0 - np.arange(x.size) / x.size, where="post", color=c, lw=1.5, label=lab)
+    axs[0, 0].set(xlabel="s (phases one after the other)", ylabel="ms", ylim=(0, None),
+                  title="Feedback age when a command is sent: worst of each second")
+    for ax, ttl in ((axs[0, 1], "Feedback age when a command is sent"), (axs[1, 0], "Interval between two commands"),
+                    (axs[1, 1], "Interval between two frames received")):
+        ax.set(xscale="log", yscale="log", xlabel="ms (log)", ylabel="share of samples above (log)", title=ttl)
+        ax.set_xlim(left=0.5)
+        from matplotlib.ticker import LogLocator
+        ax.xaxis.set_major_locator(LogLocator(base=10, subs=(1.0, 2.0, 5.0)))
+    _plain_log_x(axs[0, 1], axs[1, 0], axs[1, 1])
+    for ax in axs.ravel():
+        ax.grid(alpha=.3, which="both")
+        ax.legend(fontsize=8)
+    fig.suptitle(f"Soak: {summ['dur_s']:g} s per load, J{', J'.join(str(j) for j in summ['joints'])}, "
+                 f"Kp {summ['kp']:g}, period {summ['P_ms']:g} ms", fontsize=10)
+    _save(fig, out, "21_soak.png", plt)
 
 
 def analyze_cartvel(res, cmap):
@@ -2474,6 +2708,9 @@ def plot_replay(res, summ, out, plt):
     tb = min(ta + 3.0, float(res["t"][-1]))
     tg = np.linspace(ta, tb, 1500)
     axs[0].plot(tg, R.true_at(tg, jb), "k", lw=1.2, label="commanded (actions at due time)")
+    if "q_clean" in res and np.any(res["q_clean"] != res["q"]):
+        axs[0].plot(tg, np.interp(tg, res["t"], res["q_clean"][:, jb]), color="0.55", ls="--", lw=1.2,
+                    label="clean motion (before noise / offsets)")
     for i, run in enumerate(r for r in res["runs"] if "tt" in r):
         fr, tt = run["frames"], run["tt"]
         sel = (tt >= ta) & (tt <= tb)
@@ -2496,7 +2733,8 @@ def plot_replay(res, summ, out, plt):
     axs[2].set(ylabel="ms", title="Delay behind the commanded trajectory")
     axs[0].grid(alpha=.3); axs[0].legend(fontsize=8)
     sub = (f"{summ['source']} actions every {summ['P_action_ms']:.0f} ms, chunks of {summ['chunk']}, "
-           f"noise {summ['noise_deg']:g} deg, jitter {summ['jitter_ms']:g} ms, chunk offset {summ['chunk_offset_deg']:g} deg")
+           f"noise {summ['noise_deg']:g} deg, jitter {summ['jitter_ms']:g} ms, chunk offset {summ['chunk_offset_deg']:g} deg"
+           + (f", smoothed over {summ['smooth']} actions" if summ.get("smooth") else ""))
     fig.suptitle(sub, fontsize=10)
     _save(fig, out, "18_replay.png", plt)
 
@@ -3337,6 +3575,16 @@ def parse_args(argv=None):
     g.add_argument("--pos-interp-ms", type=float, default=5.0, help="posi mode: one MoveJoints every ... [ms]")
     g.add_argument("--posi-adv-ms", type=float, default=None,
                    help="posi mode: send the position this far ahead [ms]; default tau + T/2 + P/2 + servo lag")
+    g.add_argument("--ref-smooth", type=int, default=0,
+                   help="track the actions through a centred Savitzky-Golay filter over N actions (odd, >= 3; "
+                        "0 = raw actions); each smoothed action waits for the N // 2 next ones")
+    g = p.add_argument_group("soak (worst cases, joints = --multi-joints, loop = --servo-kp + feedforward)")
+    g.add_argument("--soak-dur", type=float, default=120.0, help="duration per load [s]")
+    g.add_argument("--soak-loads", type=lambda s: [x.strip() for x in s.split(",") if x.strip()],
+                   default=["idle", "cpu", "gil"],
+                   help="loads, one phase each: idle, cpu (busy processes), gil (busy Python thread in this process)")
+    g.add_argument("--stress-procs", type=int, default=0, help="busy processes of the 'cpu' load (0 = one per core)")
+    g.add_argument("--soak-amp", type=float, default=2.0, help="amplitude per joint [deg] (capped by speed)")
     g = p.add_argument_group("external sensor (servo, servomulti, replay vel/ff, sensorsweep)")
     g.add_argument("--fb-delay-ms", type=float, default=0.0, help="extra delay of the position fed back [ms]")
     g.add_argument("--fb-rate-hz", type=float, default=0.0,
@@ -3389,6 +3637,18 @@ def set_high_priority():
     except Exception as e:  # noqa: BLE001
         print(f"Could not raise the process priority: {e}")
         return False
+
+
+def clock_pair(n=20):
+    """(time.time(), perf_counter()) read as close together as possible: the tightest of n tries."""
+    best = None
+    for _ in range(n):
+        a = time.perf_counter()
+        w = time.time()
+        b = time.perf_counter()
+        if best is None or b - a < best[2]:
+            best = (w, 0.5 * (a + b), b - a)
+    return best[:2]
 
 
 def expand_tests(spec):
@@ -3544,14 +3804,34 @@ def print_summary(S):
         x = S["replay"]
         print(f"\nREPLAY ({x['source']} actions every {x['P_action_ms']:.0f} ms on J{', J'.join(str(j) for j in x['joints'])}, "
               f"chunks of {x['chunk']}, noise {x['noise_deg']:g} deg, jitter {x['jitter_ms']:g} ms, chunk offset "
-              f"{x['chunk_offset_deg']:g} deg; vel: Kp {x['kp']:g}, feedforward {x['feedforward_advance_ms']:.1f} ms ahead)")
+              f"{x['chunk_offset_deg']:g} deg" + (f", smoothed over {x['smooth']} actions" if x.get("smooth") else "")
+              + f"; vel: Kp {x['kp']:g}, feedforward {x['feedforward_advance_ms']:.1f} ms ahead)")
+        clean = any("clean_rel_err_pct" in r for r in x["per_mode"])
         print("  mode | error % of ref (median over joints) | delay ms | error once delayed % | max err deg | "
-              "accel rms deg/s2 | stall % | sat % | backlog ms")
+              "accel rms deg/s2 | stall % | sat % | backlog ms"
+              + (" || vs clean motion: error % | once delayed % | accel / clean accel  (actions off by ...%)" if clean else ""))
         for r in x["per_mode"]:
             print(f"  {r['mode']:4s} | {_f(r['rel_err_pct'], '6.1f')} | {_f(r['delay_ms'], '6.1f')} | "
                   f"{_f(r['shape_rel_pct'], '6.1f')} | {_f(r['max_err_deg'], '6.3f')} | {_f(r['accel_rms'], '7.0f')} | "
                   f"{_f(r['stall_pct'], '5.1f')} | {_f(r['sat_pct'], '5.1f')} | {_f(r['backlog_ms'], '6.1f')}"
+                  + (f" || {_f(r.get('clean_rel_err_pct'), '6.1f')} | {_f(r.get('clean_shape_rel_pct'), '6.1f')} | "
+                     f"{_f(r.get('accel_ratio'), '5.2f')}  ({_f(r.get('input_dev_pct'), '4.1f')} %)" if clean else "")
                   + ("  STOPPED EARLY" if r.get("aborted") else ""))
+    if S.get("soak"):
+        x = S["soak"]
+        print(f"\nSOAK ({x['dur_s']:g} s per load on J{', J'.join(str(j) for j in x['joints'])}, Kp {x['kp']:g}, "
+              f"period {x['P_ms']:g} ms; median / p99 / p99.9 / max in ms)")
+        tl = lambda d: "n/a" if not d else f"{d['median']:5.1f} / {d['p99']:5.1f} / {d['p999']:5.1f} / {d['max']:6.1f}"
+        for r in x["phases"]:
+            print(f"  {r['load']:4s}{f' x{r['procs']}' if r['procs'] else '':4s} | feedback age {tl(r['fb_age_ms'])} | "
+                  f"send interval {tl(r['send_interval_ms'])} | frame gap {tl(r['host_rx_gap_ms'])}"
+                  + ("  STOPPED EARLY" if r.get("aborted") else ""))
+            print(f"            missing frames {r['missing_frames_pct']:4.1f} % | ticks without new feedback "
+                  f"{r['stale_ticks_pct']:4.1f} % (longest {r['longest_no_feedback_ms']:.1f} ms) | age > 10/20/50 ms: "
+                  f"{r['n_fb_age_over_10ms']}/{r['n_fb_age_over_20ms']}/{r['n_fb_age_over_50ms']} | send gap > vel timeout: "
+                  f"{r['n_send_gap_over_vel_timeout']} | error rms {r['err_rms_deg']:.3f} max {r['err_max_deg']:.3f} deg | "
+                  f"crossover at 60 deg: {_f(r.get('fc60_hz_median_age'), '4.1f')} Hz on the median age, "
+                  f"{_f(r.get('fc60_hz_p999_age'), '4.1f')} Hz on its p99.9")
     if S.get("cartvel"):
         print("\nCARTVEL (MoveLinVel steps: target velocity = delay tau + moving average T)")
         for r in S["cartvel"]:
@@ -3655,6 +3935,9 @@ def analyze_all(raw, frames, send_logs, args, out, plt):
             lambda r: plot_servomulti(raw["servomulti"], r, out, plt))
     if "replay" in raw and raw["replay"]["runs"]:
         run("replay", lambda: analyze_replay(raw["replay"], cmap), lambda r: plot_replay(raw["replay"], r, out, plt))
+    if "soak" in raw and raw["soak"]["phases"]:
+        run("soak", lambda: analyze_soak(raw["soak"], frames, cmap, mdl),
+            lambda r: plot_soak(raw["soak"], r, frames, cmap, out, plt))
     if "sensorsweep" in raw and raw["sensorsweep"]["configs"]:
         run("sensorsweep", lambda: analyze_sensorsweep(raw["sensorsweep"], cmap, mdl),
             lambda r: plot_sensorsweep(raw["sensorsweep"], r, out, plt))
@@ -3702,12 +3985,15 @@ def main():
     unknown = [t for t in tests if not hasattr(Tester, f"run_{t}")]
     if unknown:
         sys.exit(f"unknown test(s): {', '.join(unknown)}")
+    bad = [x for x in args.soak_loads if x not in LoadGen.KINDS]
+    if "soak" in tests and bad:
+        sys.exit(f"unknown soak load(s): {', '.join(bad)} (use {', '.join(LoadGen.KINDS)})")
     out = args.out or f"meca_latency_{'sim_' if args.sim else ''}{datetime.now():%Y%m%d_%H%M%S}_J{args.joint}"
     os.makedirs(out, exist_ok=True)
 
     rec = Recorder(args.joint - 1)
     io = SimIO(args, rec) if args.sim else MecaIO(args, rec)
-    raw = {}
+    raw = {"_clock": [clock_pair()]}  # wall clock <-> perf_counter, for packet captures (netcap.py)
     tester = None
     try:
         io.connect()
@@ -3725,6 +4011,7 @@ def main():
         print("\nInterrupted")
     finally:
         io.close()
+    raw["_clock"].append(clock_pair())
 
     frames = rec.frames(0)
     if len(frames) < 10:

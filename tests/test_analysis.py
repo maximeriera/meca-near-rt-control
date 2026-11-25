@@ -121,6 +121,33 @@ def test_policy_effects_chunks_and_release():
     assert rel[4] == pytest.approx(t[4] - 0.03)               # next chunk out 30 ms before it is due
 
 
+def test_smooth_actions_keeps_curvature_cuts_noise_and_waits():
+    rng = np.random.default_rng(3)
+    t = np.arange(0, 2, 0.02)
+    q = np.zeros((len(t), m.NJ))
+    q[:, 2] = 30 * t ** 2                                     # a parabola goes through order 2 untouched
+    q[:, 5] = rng.normal(0, 0.1, len(t))                      # pure noise is cut
+    qs, rel, h = m.smooth_actions(q, t.copy(), 9, [2, 5])
+    assert h == 4
+    assert np.allclose(qs[:, 2], q[:, 2], atol=1e-9)
+    assert np.std(qs[:, 5]) < 0.6 * np.std(q[:, 5])
+    assert np.all(qs[:, :2] == 0)                              # inactive joints untouched
+    assert rel[10] == pytest.approx(t[14]) and rel[-1] == pytest.approx(t[-1])   # waits for 4 more actions
+    q2, rel2, h2 = m.smooth_actions(q, t, 1, [5])
+    assert h2 == 0 and q2 is q                                # off below 3 actions
+
+
+def test_load_generator_kinds():
+    with pytest.raises(ValueError):
+        m.LoadGen("disk")
+    with m.LoadGen("gil") as g:
+        assert g._thread.is_alive()
+    assert not g._thread.is_alive()
+    with m.LoadGen("cpu", procs=1) as g:
+        assert g._procs[0].poll() is None                     # running
+    assert g._procs[0].poll() is not None                     # stopped
+
+
 # --------------------------------------------------------------------------- end to end (simulator)
 def _sim(tmp_path, *args):
     out = tmp_path / "run"
@@ -159,6 +186,32 @@ def test_sim_replay_all_interfaces(tmp_path):
             continue
         assert -5 < r["delay_ms"] < 150, r
         assert r["rel_err_pct"] < 80, r
+        assert np.isfinite(r["clean_rel_err_pct"]) and r["input_dev_pct"] > 0, r   # noisy actions vs clean motion
+
+
+def test_sim_replay_smoothing_with_lead(tmp_path):
+    """Noisy 50 Hz actions published 100 ms ahead: smoothing over 7 actions waits 60 ms for the next
+    3, which leaves 40 ms for the feedforward advance: smoother motion, no extra error."""
+    base = ["--tests", "replay", "--multi-joints", "6", "--replay-dur", "3", "--ref-noise-deg", "0.05",
+            "--ref-lead-ms", "100", "--replay-modes", "vel", "--model-tau", "1", "--model-T", "20"]
+    raw = _sim(tmp_path / "raw", *base)["replay"]["per_mode"][0]
+    smo = _sim(tmp_path / "smooth", *base, "--ref-smooth", "7")["replay"]
+    assert smo["smooth"] == 7
+    smo = smo["per_mode"][0]
+    assert smo["accel_ratio"] < 0.8 * raw["accel_ratio"]
+    assert smo["clean_rel_err_pct"] < raw["clean_rel_err_pct"] + 2
+
+
+def test_sim_soak(tmp_path):
+    S = _sim(tmp_path, "--tests", "soak", "--multi-joints", "1,6", "--soak-dur", "3", "--soak-loads", "idle,gil",
+             "--model-tau", "1", "--model-T", "20")
+    ph = {r["load"]: r for r in S["soak"]["phases"]}
+    assert set(ph) == {"idle", "gil"}
+    for r in ph.values():
+        assert abs(r["loop_hz"] - 500) < 50                 # --period 2 ms
+        assert r["fb_age_ms"]["p999"] >= r["fb_age_ms"]["median"] > 0
+        assert r["n_send_gap_over_vel_timeout"] == 0
+        assert r["fc60_hz_p999_age"] <= r["fc60_hz_median_age"]
 
 
 def test_sim_sensorsweep_and_cartvel(tmp_path):

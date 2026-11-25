@@ -23,6 +23,8 @@ Tables written (only those with data):
   replay.csv         policy-like action streams per interface and joint (with the stream settings)
   sensorsweep.csv    host loop through an emulated sensor   sensor_table.csv  predicted crossover
   cartvel.csv        Cartesian velocity interface per axis
+  soak.csv           worst-case timing per load (idle / cpu / gil)
+  netcap.csv         packet capture vs recorded frames (netcap.py output, netcap.json)
 """
 from __future__ import annotations
 
@@ -54,6 +56,7 @@ SECTIONS = {
     "sensorsweep": lambda S: (S.get("sensorsweep") or {}).get("rows"),
     "sensor_table": lambda S: (S.get("external_loop_prediction") or {}).get("sensor_table"),
     "cartvel": lambda S: S.get("cartvel"),
+    "soak": lambda S: (S.get("soak") or {}).get("phases"),
 }
 
 
@@ -147,6 +150,10 @@ def main():
         for name, get in SECTIONS.items():
             for item in get(S) or []:
                 tables.setdefault(name, []).append({**base, **flatten(item)})
+        nc = os.path.join(folder, "netcap.json")
+        if os.path.isfile(nc):
+            with open(nc, encoding="utf-8") as fh:
+                tables.setdefault("netcap", []).append({**base, **flatten(json.load(fh))})
     os.makedirs(a.out, exist_ok=True)
     for name, rows in tables.items():
         if rows:

@@ -5,3 +5,5 @@ meca_latency_*/
 __pycache__/
 .pytest_cache/
 aggregate*/
+*.pcap
+*.pcapng
