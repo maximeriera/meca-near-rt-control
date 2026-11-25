@@ -80,6 +80,35 @@ def test_action_ref_uses_only_released_actions():
     assert R.slope(0.20, now=1.0)[0] == 0.0
 
 
+def test_action_ref_quadratic_extrapolation_is_exact_on_a_parabola():
+    t = np.arange(0, 0.1, 0.02)
+    q = np.zeros((len(t), m.NJ))
+    q[:, 0] = 100 * t ** 2                            # constant acceleration 200 deg/s^2
+    R1 = m.ActionRef(t, q, release=t, horizon=0.05, order=1)
+    R2 = m.ActionRef(t, q, release=t, horizon=0.05, order=2)
+    now, te = t[3], t[3] + 0.02                       # 4 actions out, asked one period ahead
+    assert R2.at(te, now)[0] == pytest.approx(100 * te ** 2)
+    assert R2.slope(te, now)[0] == pytest.approx(200 * te)
+    assert R1.slope(te, now)[0] < 200 * te - 5        # the last slope lags
+
+
+def test_sensor_emu_delays_and_holds():
+    s = m.SensorEmu(delay_s=0.010, rate_hz=50.0)
+    seen = [s.observe(t, float(t), f"frame{t:.3f}") for t in np.arange(0, 0.1, 0.002)]
+    y = dict(zip(np.round(np.arange(0, 0.1, 0.002), 3), (v for v, _ in seen)))
+    assert y[0.03] == pytest.approx(0.02)             # sample of t = 20 ms, out at 30 ms
+    assert y[0.048] == pytest.approx(0.02)            # held until the next one (40 ms + 10 ms)
+    assert y[0.05] == pytest.approx(0.04)
+    assert m.SensorEmu().observe(1.0, 3.0, "f") == (3.0, "f")   # default: untouched
+
+
+def test_sensor_table_slower_sensor_lower_crossover():
+    mdl = dict(tau=0.004, T=0.0159, P=0.002, tau_b=0.0039, tau_s=0.0003, fb_actual=True)
+    tab = {(r["rate_hz"], r["latency_ms"]): r["fc60_hz"] for r in m.sensor_table(mdl, (1000, 30), (5, 50))}
+    assert tab[(1000, 5)] > tab[(30, 5)] > tab[(30, 50)]
+    assert 4 < tab[(1000, 5)] < 6                     # the robot's own feedback: ~5 Hz
+
+
 def test_policy_effects_chunks_and_release():
     a = m.parse_args(["--ref-chunk", "4", "--ref-chunk-offset-deg", "0.5", "--ref-jitter-ms", "3"])
     t = np.arange(0, 0.2, 0.02)
@@ -120,12 +149,29 @@ def test_sim_servomulti_matches_model(tmp_path):
 
 def test_sim_replay_all_interfaces(tmp_path):
     S = _sim(tmp_path, "--tests", "step,replay", "--multi-joints", "1,6", "--replay-dur", "3",
-             "--ref-chunk", "8", "--ref-noise-deg", "0.02", "--ref-jitter-ms", "5", "--ref-chunk-offset-deg", "0.1")
+             "--ref-chunk", "8", "--ref-noise-deg", "0.02", "--ref-jitter-ms", "5", "--ref-chunk-offset-deg", "0.1",
+             "--ref-predict", "quad")
     rows = S["replay"]["rows"]
-    assert {(r["mode"], r["joint"]) for r in rows} == {(mo, j) for mo in ("vel", "ff", "pos") for j in (1, 6)}
+    assert {(r["mode"], r["joint"]) for r in rows} == {(mo, j) for mo in ("vel", "ff", "pos", "posi") for j in (1, 6)}
     for r in rows:
+        assert np.isfinite(r["rel_err_pct"]), r
+        if r["mode"] == "ff":   # open loop: drifts with noise and late chunks, its "delay" means little
+            continue
         assert -5 < r["delay_ms"] < 150, r
         assert r["rel_err_pct"] < 80, r
+
+
+def test_sim_sensorsweep_and_cartvel(tmp_path):
+    S = _sim(tmp_path, "--tests", "step,sensorsweep,cartvel", "--sensor-rates", "0,30", "--sensor-delays", "20",
+             "--sensor-freqs", "1", "--cart-axes", "x,rz")
+    sw = {r["rate_hz"]: r for r in S["sensorsweep"]["rows"]}
+    assert sw[30]["fb_age_ms"] > sw[0]["fb_age_ms"] + 15      # 20 ms + half of the 33 ms hold
+    assert sw[30]["kp"] < sw[0]["kp"]                         # slower sensor, lower gain for 60 deg
+    for r in S["sensorsweep"]["rows"]:
+        assert abs(r["gain_1hz"] - r["model_gain_1hz"]) < 0.1
+    cv = {r["axis"]: r for r in S["cartvel"]}
+    assert set(cv) == {"x", "rz"} and all(abs(r["T_ms"] - 20) < 1 for r in cv.values())   # sim: joint law
+    assert S["external_loop_prediction"]["sensor_table"]
 
 
 # --------------------------------------------------------------------------- recorded runs (slow)

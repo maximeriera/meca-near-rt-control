@@ -21,6 +21,8 @@ Tables written (only those with data):
   posinterrupt.csv   ClearMotion re-targeting       servo_steps.csv / servo_sines.csv
   servomulti.csv     host loop on several joints at once
   replay.csv         policy-like action streams per interface and joint (with the stream settings)
+  sensorsweep.csv    host loop through an emulated sensor   sensor_table.csv  predicted crossover
+  cartvel.csv        Cartesian velocity interface per axis
 """
 from __future__ import annotations
 
@@ -49,6 +51,9 @@ SECTIONS = {
     "servomulti": lambda S: (S.get("servomulti") or {}).get("rows"),
     "replay": lambda S: [{**{k: v for k, v in S["replay"].items() if k not in ("rows", "per_mode")}, **r}
                          for r in S["replay"]["rows"]] if S.get("replay") else None,
+    "sensorsweep": lambda S: (S.get("sensorsweep") or {}).get("rows"),
+    "sensor_table": lambda S: (S.get("external_loop_prediction") or {}).get("sensor_table"),
+    "cartvel": lambda S: S.get("cartvel"),
 }
 
 

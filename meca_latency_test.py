@@ -55,9 +55,17 @@ Tests (--tests: comma separated names and/or groups vel, pos, servo, all)
               feedforward): does tracking hold when all joints move?
  Physical AI
   replay      a policy-like action stream on --multi-joints (CSV --ref-file, or synthetic motion with
-              --ref-chunk / --ref-noise-deg / --ref-jitter-ms / --ref-chunk-offset-deg) through
-              --replay-modes vel (loop + feedforward), ff (feedforward only), pos (MoveJoints stream):
-              error, delay, error once delayed, smoothness, backlog
+              --ref-chunk / --ref-noise-deg / --ref-jitter-ms / --ref-chunk-offset-deg / --ref-lead-ms)
+              through --replay-modes vel (loop + feedforward), ff (feedforward only), pos (one MoveJoints
+              per action), posi (MoveJoints every --pos-interp-ms to the host-interpolated position):
+              error, delay, error once delayed, smoothness, backlog. --ref-predict quad extrapolates
+              with the last change of slope.
+ External sensor
+  sensorsweep the host loop through an emulated sensor (--sensor-rates x --sensor-delays, Kp from
+              the model for --sensor-pm): step + sines vs the model. --fb-delay-ms / --fb-rate-hz /
+              --fb-noise-deg put the same sensor in servo, servomulti and replay.
+ Cartesian
+  cartvel     MoveLinVelWrf / Trf steps along --cart-axes from --cart-pose: tau, T, servo lag
   timing      (always) RT frame period / missing frames, feedback transport, send jitter
 
 Usage
@@ -91,6 +99,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import deque
 from datetime import datetime
 
 import numpy as np
@@ -109,11 +118,13 @@ DEFAULT_BLENDING = 100.0     # MX_MQ_DEFAULT_BLENDING
 J6_T_FLOOR_MS, J6_T_MS_PER_PCT, J6_TAU_MS = 15.6, 1.0, 3.5
 
 # Columns of one feedback frame.
-#   0-5 : the tested joint (--joint), same layout as v1 of this script
-#   6-29: every joint, see col()
+#   0-5  : the tested joint (--joint), same layout as v1 of this script
+#   6-29 : every joint, see col()
+#   30-53: Cartesian target / actual pose and velocity (x, y, z [mm], alpha, beta, gamma [deg]),
+#          only filled when cartvel runs (runs recorded before 2026-11-25 14h have 30 columns)
 HOST, ROBOT, TPOS, TVEL, APOS, AVEL = range(6)
-K_TPOS, K_TVEL, K_APOS, K_AVEL = range(4)
-NCOL = 6 + 4 * NJ
+K_TPOS, K_TVEL, K_APOS, K_AVEL, K_TCART, K_TCVEL, K_ACART, K_ACVEL = range(8)
+NCOL = 6 + 8 * NJ
 NAN6 = np.full(NJ, np.nan)
 
 TEST_GROUPS = {
@@ -123,7 +134,7 @@ TEST_GROUPS = {
     "servo": ["servo"],
 }
 TEST_GROUPS["all"] = (["vmaxcheck"] + TEST_GROUPS["vel"] + TEST_GROUPS["pos"] + TEST_GROUPS["servo"]
-                      + ["servomulti", "replay"])
+                      + ["servomulti", "replay", "sensorsweep", "cartvel"])
 
 
 def col(kind: int, j: int) -> int:
@@ -168,14 +179,14 @@ class Recorder:
         self.cond = threading.Condition()
         self._last_robot_t = None
 
-    def add(self, host_t, robot_t, tp, tv, ap, av):
+    def add(self, host_t, robot_t, tp, tv, ap, av, ctp=NAN6, ctv=NAN6, cap=NAN6, cav=NAN6):
         if robot_t == self._last_robot_t:  # same cycle seen twice
             return
         self._last_robot_t = robot_t
         j = self.j
         row = np.empty(NCOL)
         row[:6] = (host_t, robot_t, tp[j], tv[j], ap[j], av[j])
-        row[6:] = np.concatenate([tp, tv, ap, av])
+        row[6:] = np.concatenate([tp, tv, ap, av, ctp, ctv, cap, cav])
         with self.cond:
             c, i = divmod(self.n, self.CHUNK)
             if c == len(self.chunks):
@@ -229,8 +240,11 @@ class MecaIO:
         """Only the RT events we need, to keep 1 ms monitoring light. Falls back to 'all'."""
         try:
             from mecademicpy import mx_robot_def as mx
-            names = ("MX_ST_RT_TARGET_JOINT_POS", "MX_ST_RT_TARGET_JOINT_VEL",
-                     "MX_ST_RT_JOINT_POS", "MX_ST_RT_JOINT_VEL")
+            names = ["MX_ST_RT_TARGET_JOINT_POS", "MX_ST_RT_TARGET_JOINT_VEL",
+                     "MX_ST_RT_JOINT_POS", "MX_ST_RT_JOINT_VEL"]
+            if "cartvel" in expand_tests(self.args.tests):  # Cartesian data only when needed
+                names += ["MX_ST_RT_TARGET_CART_POS", "MX_ST_RT_TARGET_CART_VEL",
+                          "MX_ST_RT_CART_POS", "MX_ST_RT_CART_VEL"]
             return [int(getattr(mx.MxRobotStatusCode, n)) for n in names]
         except Exception:
             return ["all"]
@@ -323,7 +337,9 @@ class MecaIO:
         ts = getattr(d.rt_target_joint_pos, "timestamp", None) or d.rt_joint_pos.timestamp
         self.rec.add(host_t, ts * 1e-6,  # robot timestamps are in microseconds
                      get("rt_target_joint_pos"), get("rt_target_joint_vel"),
-                     get("rt_joint_pos"), get("rt_joint_vel"))
+                     get("rt_joint_pos"), get("rt_joint_vel"),
+                     get("rt_target_cart_pos"), get("rt_target_cart_vel"),
+                     get("rt_cart_pos"), get("rt_cart_vel"))
 
     def _on_cycle(self, *_, **__):
         if not self._polling:
@@ -391,6 +407,17 @@ class MecaIO:
 
     def move_joints(self, q):
         self.robot.MoveJoints(*[float(x) for x in q])
+
+    def send_cart_vel(self, v, frame="wrf"):
+        """Cartesian velocity (vx, vy, vz [mm/s], wx, wy, wz [deg/s]) in the world or tool frame."""
+        cmd = self.robot.MoveLinVelTrf if frame == "trf" else self.robot.MoveLinVelWrf
+        cmd(*[float(x) for x in v])
+
+    def set_cart_acc(self, pct):
+        return self._setting("SetCartAcc", pct)
+
+    def get_cart_acc(self):
+        return self._get("GetCartAcc")
 
     def clear_motion(self):
         """ClearMotion includes an implicit PauseMotion, hence the ResumeMotion."""
@@ -532,7 +559,9 @@ class SimIO:
                     arrive = max(self._last_out, now + 0.0003 + self.rng_out.exponential(0.0003))
                     self._last_out = arrive
                     rt = now * (1 + 40e-6) + 1234.5
-                    self.outbox.append((arrive, rt, self.tp.copy(), self.tv.copy(), apq, avq))
+                    # no kinematics here: the "Cartesian" signals are the joint ones (fake, for dry runs)
+                    self.outbox.append((arrive, rt, self.tp.copy(), self.tv.copy(), apq, avq,
+                                        self.tp.copy(), self.tv.copy(), apq, avq))
                 ready = []
                 while self.outbox and self.outbox[0][0] <= now:
                     ready.append(self.outbox.pop(0))
@@ -556,6 +585,15 @@ class SimIO:
 
     def move_joints(self, q):
         self._post("mj", np.asarray(q, float).copy())
+
+    def send_cart_vel(self, v, frame="wrf"):
+        self._post("vel", np.asarray(v, float).copy())  # fake: Cartesian axis k drives joint k
+
+    def set_cart_acc(self, pct):
+        return self._set("cart_acc_pct", pct)
+
+    def get_cart_acc(self):
+        return getattr(self, "cart_acc_pct", 100.0)
 
     def clear_motion(self):
         self._post("clear", None)
@@ -622,14 +660,52 @@ def piecewise(segs):
     return lambda t: vals[min(int(np.searchsorted(bounds, t + 1e-9, side="right")), len(vals) - 1)]
 
 
+class SensorEmu:
+    """An external position sensor in the host loop (camera, tracker): it samples the robot
+    position every 1/rate s (every loop tick when rate <= 0), adds white noise, and the controller
+    gets the sample `delay` s later and holds it until the next one arrives. All zero (default):
+    the robot's own feedback, untouched. The frame returned with the sample is the one it was
+    taken from, so the logged feedback age includes the sensor delay and the hold."""
+
+    def __init__(self, delay_s=0.0, rate_hz=0.0, noise_deg=0.0, seed=0):
+        self.delay, self.rate, self.noise = float(delay_s), float(rate_hz), float(noise_deg)
+        self.rng = np.random.default_rng(seed)
+        self.queue, self.next_t, self.held = deque(), 0.0, None
+
+    @classmethod
+    def from_args(cls, a):
+        return cls(getattr(a, "fb_delay_ms", 0.0) * 1e-3, getattr(a, "fb_rate_hz", 0.0),
+                   getattr(a, "fb_noise_deg", 0.0), getattr(a, "ref_seed", 0))
+
+    @property
+    def passthrough(self):
+        return self.delay == 0 and self.rate <= 0 and self.noise == 0
+
+    def observe(self, t, y, frame):
+        if self.passthrough:
+            return y, frame
+        if self.rate <= 0 or t >= self.next_t - 1e-12:
+            noisy = y + (self.rng.normal(0.0, self.noise, np.shape(y)) if self.noise > 0 else 0.0)
+            self.queue.append((t + self.delay, noisy, frame))
+            if self.rate > 0:
+                while self.next_t <= t + 1e-12:
+                    self.next_t += 1.0 / self.rate
+        while self.queue and self.queue[0][0] <= t + 1e-12:
+            _, yh, fh = self.queue.popleft()
+            self.held = (yh, fh)
+        return self.held if self.held is not None else (y, frame)
+
+
 class ActionRef:
     """A stream of actions q_k (offsets from the start pose, deg, one row of 6 per action) due at
     t_k and known to the controller from release_k on (a policy that is late, or that publishes a
     whole chunk at once). What the controller can compute at time `now` for time te: linear
-    interpolation of the released actions; past the last released one, its last slope continues
-    for at most `horizon` (a late action), then the position is held."""
+    interpolation of the released actions; past the last released one, an extrapolation for at
+    most `horizon` (a late action), then the position is held. order 1 continues the last slope;
+    order 2 also uses the last change of slope (it removes the half-period lag of the slope,
+    at the cost of amplifying noise)."""
 
-    def __init__(self, t, q, release, horizon):
+    def __init__(self, t, q, release, horizon, order=1):
         self.t = np.asarray(t, float)
         self.q = np.asarray(q, float)
         self.rel = np.maximum.accumulate(np.asarray(release, float))
@@ -637,9 +713,21 @@ class ActionRef:
         if len(self.t) > 1:
             self.s[:-1] = np.diff(self.q, axis=0) / np.diff(self.t)[:, None]
         self.horizon = horizon
+        self.order = order
 
     def released(self, now):
         return int(np.searchsorted(self.rel, now, side="right"))
+
+    def _extrap(self, n, te):
+        """(position, velocity) at te past the last released action (index n - 1)."""
+        last = n - 1
+        dt = min(te - self.t[last], self.horizon)
+        if self.order == 2 and n >= 3:
+            h1, h0 = self.t[last] - self.t[last - 1], self.t[last - 1] - self.t[last - 2]
+            acc = (self.s[last - 1] - self.s[last - 2]) / (0.5 * (h1 + h0))
+            v = self.s[last - 1] + acc * h1 / 2      # velocity at the last action
+            return self.q[last] + v * dt + 0.5 * acc * dt * dt, v + acc * dt
+        return self.q[last] + self.s[last - 1] * dt, self.s[last - 1].copy()
 
     def at(self, te, now):
         n = self.released(now)
@@ -652,7 +740,7 @@ class ActionRef:
             return self.q[i] + self.s[i] * (te - self.t[i])
         if n == 1 or n == len(self.t):
             return self.q[n - 1].copy()
-        return self.q[n - 1] + self.s[n - 2] * min(te - self.t[n - 1], self.horizon)
+        return self._extrap(n, te)[0]
 
     def slope(self, te, now):
         n = self.released(now)
@@ -665,7 +753,7 @@ class ActionRef:
             return self.s[i].copy()
         if n == len(self.t) or te - self.t[n - 1] > self.horizon:
             return np.zeros(NJ)
-        return self.s[n - 2].copy()
+        return self._extrap(n, te)[1]
 
     def true_at(self, te, j):
         """The commanded trajectory itself (every action, at its due time) for joint j."""
@@ -1158,13 +1246,15 @@ class Tester:
         return dict(events=np.array(ev), frames=frames, dist=d, vel_pct=a.int_joint_vel_pct)
 
     # -- external position loop ----------------------------------------------
-    def _servo_loop(self, ref, dref, kp, adv, dur):
+    def _servo_loop(self, ref, dref, kp, adv, dur, sensor=None):
         """Fixed-rate loop at --period: read the latest frame, v = kp (r - y) [+ dref(t + adv)],
-        clamp, MoveJointsVel. Log: ts, t_send, t_after, v, r, y, robot_ts and host_rx of the frame used."""
+        clamp, MoveJointsVel. The position goes through `sensor` (default: --fb-* options).
+        Log: ts, t_send, t_after, v, r, y, robot_ts and host_rx of the frame behind the y used."""
         a, P = self.args, self.args.period
         fbcol = APOS if a.servo_fb == "actual" else TPOS
         vmax = 0.95 * self.vlim
         q0 = self.start_pos
+        sensor = sensor or SensorEmu.from_args(a)
         i0 = self.rec.n
         log = []
         aborted = False
@@ -1177,6 +1267,7 @@ class Tester:
                 fr = self.rec.latest()
                 y = (fr[fbcol] if np.isfinite(fr[fbcol]) else fr[TPOS]) - q0
                 t = k * P
+                y, fr = sensor.observe(t, y, fr)
                 r = ref(t)
                 v = kp * (r - y) + (dref(t + adv) if dref else 0.0)
                 v = min(max(v, -vmax), vmax)
@@ -1235,14 +1326,16 @@ class Tester:
                                 (lambda t: A * w * math.cos(w * (t + adv))) if ff else None,
                                 self.args.servo_kp, dur, A > 0)
 
-    def _track_loop(self, ref_fn, ff_fn, kp, dur, active):
+    def _track_loop(self, ref_fn, ff_fn, kp, dur, active, sensor=None):
         """Host position loop on the `active` joints at once, every --period:
         v = kp (ref_fn(t) - y) + ff_fn(t), one MoveJointsVel for all joints. t = loop time [s].
+        The positions go through `sensor` (default: --fb-* options).
         Log: ts, t_send, t_after, v1..v6, r1..r6, y1..y6, robot_ts and host_rx of the frame used."""
         a, P = self.args, self.args.period
         kind = K_APOS if a.servo_fb == "actual" else K_TPOS
         vmax = 0.95 * self.vlim_all
         q0 = self.start_all.copy()
+        sensor = sensor or SensorEmu.from_args(a)
         i0 = self.rec.n
         log = []
         aborted = False
@@ -1256,6 +1349,7 @@ class Tester:
                 y = alljoints(fr, kind)
                 y = np.where(np.isfinite(y), y, alljoints(fr, K_TPOS)) - q0
                 t = k * P
+                y, fr = sensor.observe(t, y, fr)
                 r = ref_fn(t)
                 v = kp * (r - y) + (ff_fn(t) if ff_fn else 0.0)
                 v = np.where(active, np.clip(v, -vmax, vmax), 0.0)
@@ -1324,11 +1418,15 @@ class Tester:
             raise SafetyStop(f"replay reference reaches {peak:.1f} deg from start (> 80 % of --max-excursion)")
         P_act = float(np.median(np.diff(t)))
         adv = a.servo_adv_ms * 1e-3 if a.servo_adv_ms is not None else self.model_delay()
-        R = ActionRef(t, q, release, horizon=max(2 * P_act, adv + 2 * a.period))
+        Pi = a.pos_interp_ms * 1e-3
+        adv_pos = a.posi_adv_ms * 1e-3 if a.posi_adv_ms is not None else self.model_delay() - a.period / 2 + Pi / 2
+        R = ActionRef(t, q, release, horizon=max(2 * P_act, adv + 2 * a.period, adv_pos + 2 * Pi),
+                      order=2 if a.ref_predict == "quad" else 1)
         active = np.zeros(NJ, bool)
         active[js] = True
         out = dict(joints=js, t=t, q=q, release=release, source=src, P_action=P_act, chunk=a.ref_chunk,
                    noise_deg=a.ref_noise_deg, jitter_ms=a.ref_jitter_ms, chunk_offset_deg=a.ref_chunk_offset_deg,
+                   lead_ms=a.ref_lead_ms, predict=a.ref_predict, posi_period=Pi, posi_adv=adv_pos,
                    kp=a.servo_kp, adv=adv, P=a.period, vmax=0.95 * self.vlim_all, fb=a.servo_fb,
                    settle=a.replay_settle, runs=[])
         dur = float(t[-1]) + 0.5
@@ -1344,6 +1442,10 @@ class Tester:
             elif mode == "pos":
                 print(f"  replay through MoveJoints (blending {a.blending:g} %, SetJointVel {a.pos_joint_vel_pct:g} %)")
                 res = self._pos_replay(R, dur)
+            elif mode == "posi":
+                print(f"  replay through MoveJoints every {Pi * 1e3:g} ms, interpolated on the host, "
+                      f"{adv_pos * 1e3:.1f} ms ahead")
+                res = self._posi_replay(R, dur, Pi, adv_pos)
             else:
                 print(f"  unknown replay mode '{mode}', skipped")
                 continue
@@ -1352,6 +1454,174 @@ class Tester:
             if res["aborted"]:
                 print(f"    '{mode}' stopped early (error above --servo-abort); going on with the next interface")
         return out
+
+    def _posi_replay(self, R, dur, Pi, adv):
+        """MoveJoints every Pi to the position the host interpolates from the released actions,
+        adv ahead (the robot's own delay on a fast MoveJoints stream)."""
+        a, io = self.args, self.io
+        io.set_joint_vel(a.pos_joint_vel_pct)
+        io.set_blending(a.blending)
+        q0 = self.start_all.copy()
+        i0 = self.rec.n
+        log = []
+        t0 = time.perf_counter() + 0.01
+        k = 0
+        try:
+            while k * Pi <= dur:
+                ts = t0 + k * Pi
+                sleep_until(ts)
+                qk = R.at(k * Pi + adv, k * Pi)
+                t1 = time.perf_counter()
+                io.move_joints(q0 + qk)
+                t2 = time.perf_counter()
+                log.append(np.concatenate([[ts, t1, t2], qk]))
+                if k % 10 == 0:
+                    self.guard()
+                k += 1
+        except BaseException:
+            io.clear_motion()
+            raise
+        t_last = time.perf_counter()
+        try:
+            io.wait_idle(max(a.pos_backlog_timeout, dur))
+        except Exception as e:  # noqa: BLE001
+            print(f"    queue not drained ({e}) -> ClearMotion")
+            io.clear_motion()
+        time.sleep(0.1)
+        return dict(log=np.array(log).reshape(-1, 3 + NJ), frames=self.rec.frames(i0), q0=q0, aborted=False,
+                    t0=t0, t_last=t_last)
+
+    def run_sensorsweep(self):
+        """Host loop on the tested joint through an emulated sensor, for each --sensor-rates x
+        --sensor-delays: Kp set from the model for --sensor-pm of phase margin, then a step and
+        sines at --sensor-freqs (feedback only: what the sensor limits)."""
+        a = self.args
+        qm = self.quick_model or {}
+        tau = (qm.get("tau_ms") or J6_TAU_MS) * 1e-3
+        T = (qm.get("T_ms") or max(J6_T_FLOOR_MS, J6_T_MS_PER_PCT * a.vel_limit_pct)) * 1e-3
+        lag = max(0.0, self.quick_servo_lag or 0.0) * 1e-3
+        vmax = 0.95 * self.vlim
+        S, t_on, hold = a.servo_step, 0.2, a.servo_hold
+        out = dict(configs=[], pm=a.sensor_pm, noise_deg=a.fb_noise_deg)
+        for rate in a.sensor_rates:
+            for dly in a.sensor_delays:
+                m = dict(tau=tau, T=T, P=a.period, tau_s=lag, fb_actual=a.servo_fb == "actual",
+                         tau_b=a.sensor_base_fb_ms * 1e-3 + dly * 1e-3 + (0.5 / rate if rate > 0 else 0.0))
+                kp = float(min(kp_for_pm(a.sensor_pm, m)["kp"], 60.0))
+                print(f"  sensor {'every frame' if rate <= 0 else f'{rate:g} Hz'} + {dly:g} ms: "
+                      f"Kp {kp:.1f} 1/s for {a.sensor_pm:g} deg of phase margin")
+                steps, sines = [], []
+                res = self._servo_loop(lambda t: S if t_on <= t < t_on + hold else 0.0, None, kp, 0.0,
+                                       t_on + 2 * hold, sensor=SensorEmu(dly * 1e-3, rate, a.fb_noise_deg, a.ref_seed))
+                steps.append(dict(kp=kp, step=S, t_on=t_on, hold=hold, **res))
+                self.home()
+                for f in a.sensor_freqs:
+                    w = 2 * math.pi * f
+                    A = min(a.servo_amp, 0.5 * vmax / w)
+                    settle = max(0.5, 1.0 / f)
+                    res = self._servo_loop(lambda t: A * math.sin(w * t), None, kp, 0.0, settle + max(3.0 / f, 1.5),
+                                           sensor=SensorEmu(dly * 1e-3, rate, a.fb_noise_deg, a.ref_seed))
+                    sines.append(dict(kp=kp, ff=False, f=f, A=A, settle=settle, **res))
+                    self.home()
+                out["configs"].append(dict(rate=rate, delay_ms=dly, kp=kp,
+                                           servo=dict(steps=steps, sines=sines, P=a.period, vmax=vmax, adv=0.0,
+                                                      fb=a.servo_fb)))
+        return out
+
+    # -- Cartesian velocity -------------------------------------------------------
+    def _goto(self, q):
+        """Stop, MoveJoints to q (absolute joint angles) and make it the reference pose of the guard."""
+        self.io.stop()
+        self.io.move_joints(q)
+        self.io.wait_idle(60)
+        time.sleep(0.2)
+        fr = self.rec.latest()
+        self.start_all = alljoints(fr, K_TPOS).copy()
+        self.start_pos = float(fr[TPOS])
+        self.cart_start = alljoints(fr, K_TCART).copy()
+
+    def cart_guard(self):
+        a = self.args
+        fr = self.rec.latest()
+        if fr is None or getattr(self, "cart_start", None) is None or not np.isfinite(self.cart_start).all():
+            return
+        d = alljoints(fr, K_TCART) - self.cart_start
+        lin = float(np.linalg.norm(d[:3]))
+        ang = float(np.max(np.abs((d[3:] + 180) % 360 - 180)))
+        if lin > 1.5 * a.cart_max_mm or ang > 1.5 * a.cart_max_deg:
+            raise SafetyStop(f"tool moved {lin:.1f} mm / {ang:.1f} deg from its start "
+                             f"(limits {a.cart_max_mm:g} mm, {a.cart_max_deg:g} deg, x1.5)")
+
+    def stream_cart(self, profile, duration, frame):
+        """Send the Cartesian velocity profile(t) (6-vector) every --period. Returns (cmd log, frames)."""
+        P = self.args.period
+        n = int(round(duration / P))
+        log = np.full((n, 4 + NJ), np.nan)
+        i0 = self.rec.n
+        t0 = time.perf_counter() + 0.01
+        done = 0
+        try:
+            for k in range(n):
+                ts = t0 + k * P
+                sleep_until(ts)
+                v = np.asarray(profile(k * P), float)
+                t1 = time.perf_counter()
+                self.io.send_cart_vel(v, frame)
+                t2 = time.perf_counter()
+                log[k, :4] = (ts, t1, t2, v[int(np.argmax(np.abs(v)))] if np.any(v) else 0.0)
+                log[k, 4:] = v
+                done = k + 1
+                if k % 5 == 0:
+                    self.guard()
+                    self.cart_guard()
+        finally:
+            self.io.send_cart_vel(np.zeros(NJ), frame)
+        time.sleep(0.15)
+        log = log[:done]
+        self.send_logs.append(log)
+        return log, self.rec.frames(i0)
+
+    def run_cartvel(self):
+        """Cartesian velocity steps (MoveLinVelWrf / Trf) along --cart-axes from --cart-pose (a pose
+        away from the wrist singularity of the home position), at each --cart-acc-pcts: delay and
+        moving average of the Cartesian interface, as for the joints."""
+        a, io = self.args, self.io
+        names = ["x", "y", "z", "rx", "ry", "rz"]
+        pose = np.asarray(a.cart_pose, float)
+        base_acc = io.get_cart_acc()
+        accs = a.cart_acc_pcts or [None]
+        runs = []
+        print(f"  start pose {np.round(pose, 1)} deg, frame {a.cart_frame.upper()}, SetCartAcc before: {base_acc}")
+        try:
+            self._goto(pose)
+            for acc in accs:
+                if acc is not None:
+                    print(f"  SetCartAcc({acc:g})")
+                    if not io.set_cart_acc(acc):
+                        continue
+                for ax in a.cart_axes:
+                    k = names.index(ax)
+                    lin = k < 3
+                    A = a.cart_amp_mm if lin else a.cart_amp_deg
+                    hold = min(a.step_hold, 0.7 * (a.cart_max_mm if lin else a.cart_max_deg) / A)
+                    shape = piecewise([(0.15, 0.0), (hold, 1.0), (hold, 0.0), (hold, -1.0), (0.35, 0.0)])
+                    unit = np.zeros(NJ)
+                    unit[k] = A
+                    print(f"  {ax}: +/-{A:g} {'mm/s' if lin else 'deg/s'}, hold {hold * 1e3:.0f} ms")
+                    for _ in range(max(2, a.repeats // 2)):
+                        cmd, fr = self.stream_cart(lambda t, u=unit: shape(t) * u, 0.5 + 3 * hold, a.cart_frame)
+                        if io.recover_if_error():
+                            print("    the robot refused the motion (error reset): axis skipped")
+                            self._goto(pose)
+                            break
+                        runs.append(dict(axis=ax, k=k, A=A, acc=acc, cmd=cmd, frames=fr))
+                        self._goto(pose)
+        finally:
+            if a.cart_acc_pcts and base_acc is not None:
+                io.set_cart_acc(base_acc)
+            self.cart_start = None
+            self.home()
+        return dict(frame=a.cart_frame, pose=pose, cart_acc_before=base_acc, runs=runs)
 
     def run_servomulti(self):
         """Host position loop on all --multi-joints at once: sine references in phase, with and
@@ -2068,7 +2338,7 @@ def analyze_replay(res, cmap):
                        stall_pct=100 * float(np.mean(np.abs(tv[fast]) < 0.1 * np.max(rs))) if fast.any() else math.nan)
             if run["mode"] in ("vel", "ff"):
                 row["sat_pct"] = 100 * float(np.mean(np.abs(L[:, 3 + j]) >= 0.999 * res["vmax"][j]))
-            if run["mode"] == "pos":  # target still moving after the last MoveJoints was sent
+            if run["mode"] in ("pos", "posi"):  # target still moving after the last MoveJoints was sent
                 tv_all = fr[:, col(K_TVEL, j)]
                 mv = np.isfinite(tv_all) & (np.abs(tv_all) > 0.2)
                 row["backlog_ms"] = (float(tm[np.nonzero(mv)[0][-1]]) - run["t_last"]) * 1e3 if mv.any() else math.nan
@@ -2081,8 +2351,113 @@ def analyze_replay(res, cmap):
                                            "accel_rms", "stall_pct", "sat_pct", "backlog_ms")}) for mo in modes]
     return dict(source=res["source"], P_action_ms=res["P_action"] * 1e3, chunk=res["chunk"],
                 noise_deg=res["noise_deg"], jitter_ms=res["jitter_ms"], chunk_offset_deg=res["chunk_offset_deg"],
+                lead_ms=res.get("lead_ms", 0.0), predict=res.get("predict", "linear"),
+                posi_period_ms=res.get("posi_period", math.nan) * 1e3, posi_advance_ms=res.get("posi_adv", math.nan) * 1e3,
                 kp=res["kp"], feedforward_advance_ms=res["adv"] * 1e3, joints=[j + 1 for j in js],
                 per_mode=per_mode, rows=rows)
+
+
+def analyze_cartvel(res, cmap):
+    """Per Cartesian axis (and SetCartAcc): delay + moving average fitted on the target Cartesian
+    velocity, the same on the actual one, and their difference (servo lag)."""
+    names = ["x", "y", "z", "rx", "ry", "rz"]
+
+    def cart_vel(fr, m, kv, kp, k):
+        v = fr[:, col(kv, k)]
+        if np.isfinite(v).any():
+            return v
+        p = fr[:, col(kp, k)]
+        return np.gradient(p, m) if np.isfinite(p).sum() > 3 else v
+
+    groups = {}
+    for run in res["runs"]:
+        groups.setdefault((run["axis"], run["acc"]), []).append(run)
+    rows = []
+    for (ax, acc), runs in groups.items():
+        k = names.index(ax)
+        ft, fa = [], []
+        for run in runs:
+            c, fr = run["cmd"], run["frames"]
+            if fr.shape[1] < NCOL:
+                continue
+            m = cmap(fr[:, ROBOT])
+            ft.append(fit_boxcar(c[:, 1], c[:, 4 + k], m, cart_vel(fr, m, K_TCVEL, K_TCART, k)))
+            fa.append(fit_boxcar(c[:, 1], c[:, 4 + k], m, cart_vel(fr, m, K_ACVEL, K_ACART, k)))
+        mt, ma = model_summary(ft) or {}, model_summary(fa) or {}
+        row = dict(axis=ax, cart_acc_pct=acc, amplitude=runs[0]["A"], unit="mm/s" if k < 3 else "deg/s",
+                   tau_ms=mt.get("tau_ms", math.nan), T_ms=mt.get("T_ms", math.nan), fit_rms=mt.get("rms", math.nan),
+                   eq_delay_ms=mt.get("eq_delay_ms", math.nan))
+        if mt and ma:
+            row["servo_lag_ms"] = ma["eq_delay_ms"] - mt["eq_delay_ms"]
+        rows.append(row)
+    res["rows"] = rows
+    return rows
+
+
+def plot_cartvel(res, out, plt):
+    rows = res.get("rows") or []
+    if not rows:
+        return
+    lab = [f"{r['axis']}" + ("" if r["cart_acc_pct"] is None else f"\nacc {r['cart_acc_pct']:g} %") for r in rows]
+    x = np.arange(len(rows))
+    fig, axs = plt.subplots(1, 2, figsize=(14, 4.5))
+    axs[0].bar(x, [r["T_ms"] for r in rows], 0.5, color="C3")
+    axs[0].set(ylabel="ms", title=f"Cartesian moving-average length T ({res['frame'].upper()})")
+    axs[1].bar(x - 0.2, [r["tau_ms"] for r in rows], 0.4, label="pure delay tau")
+    axs[1].bar(x + 0.2, [r.get("servo_lag_ms", math.nan) for r in rows], 0.4, label="servo lag (actual - target)")
+    axs[1].set(ylabel="ms", title="Delays")
+    for ax in axs:
+        ax.set_xticks(x); ax.set_xticklabels(lab, fontsize=8); ax.grid(alpha=.3, axis="y")
+    axs[1].legend(fontsize=8)
+    _save(fig, out, "20_cartvel.png", plt)
+
+
+def analyze_sensorsweep(res, cmap, mdl):
+    """One analyze_servo per emulated sensor: measured step and closed-loop gain next to the
+    model fed with the measured feedback age (sensor delay and hold included)."""
+    rows = []
+    for c in res["configs"]:
+        s = analyze_servo(c["servo"], cmap, mdl)
+        if not s:
+            continue
+        st = s["steps"][0] if s["steps"] else {}
+        row = dict(rate_hz=c["rate"], delay_ms=c["delay_ms"], kp=c["kp"],
+                   fb_age_ms=(s.get("fb_age_ms") or {}).get("median"),
+                   model_pm_deg=st.get("model_pm_deg"), model_fc_hz=st.get("model_fc_hz"),
+                   rise_ms=st.get("rise_ms"), model_rise_ms=st.get("model_rise_ms"),
+                   overshoot_pct=st.get("overshoot_pct"), model_overshoot_pct=st.get("model_overshoot_pct"),
+                   settle_ms=st.get("settle_ms"), model_settle_ms=st.get("model_settle_ms"))
+        for sn in s["sines"]:
+            row[f"gain_{sn['f']:g}hz"] = sn["gain"]
+            row[f"model_gain_{sn['f']:g}hz"] = sn["model_gain"]
+        rows.append(row)
+    res["rows"] = rows
+    return dict(pm=res["pm"], noise_deg=res["noise_deg"], rows=rows)
+
+
+def plot_sensorsweep(res, summ, out, plt):
+    rows = summ.get("rows") or []
+    if not rows:
+        return
+    lab = [f"{'enc.' if r['rate_hz'] <= 0 else f'{r['rate_hz']:g} Hz'}\n+{r['delay_ms']:g} ms" for r in rows]
+    x = np.arange(len(rows))
+    fig, axs = plt.subplots(1, 3, figsize=(19, 4.8))
+    axs[0].bar(x - 0.2, [r["overshoot_pct"] for r in rows], 0.4, label="measured")
+    axs[0].bar(x + 0.2, [r["model_overshoot_pct"] for r in rows], 0.4, label="model")
+    axs[0].set(ylabel="%", title=f"Step overshoot (Kp set for {summ['pm']:g} deg of phase margin)")
+    axs[1].bar(x, [r["kp"] for r in rows], 0.5, color="C2", label="Kp")
+    ax2 = axs[1].twinx()
+    ax2.plot(x, [r["model_fc_hz"] for r in rows], "ko-", label="model crossover")
+    ax2.set_ylabel("Hz")
+    axs[1].set(ylabel="Kp [1/s]", title="Achievable gain and crossover")
+    keys = sorted({k for r in rows for k in r if k.startswith("gain_")})
+    for i, k in enumerate(keys):
+        axs[2].plot(x, [r.get(k) for r in rows], "o-", color=f"C{i}", label=f"measured {k[5:]}")
+        axs[2].plot(x, [r.get("model_" + k) for r in rows], "s--", color=f"C{i}", label=f"model {k[5:]}")
+    axs[2].set(ylabel="closed-loop gain", title="Tracking gain (feedback only)")
+    for ax in axs:
+        ax.set_xticks(x); ax.set_xticklabels(lab, fontsize=8); ax.grid(alpha=.3, axis="y"); ax.legend(fontsize=8)
+    _save(fig, out, "19_sensor_sweep.png", plt)
 
 
 def plot_replay(res, summ, out, plt):
@@ -2344,7 +2719,20 @@ def predict_external_loop(S, args, mdl):
     for pm in (60, 45):
         r = kp_for_pm(pm, m)
         out[f"pm{pm}"] = dict(kp=r["kp"], fc_hz=r["fc_hz"], gm_db=r["gm_db"])
+    if "sensorsweep" in S:  # a few seconds of computation: only when the sensor is the question
+        out["sensor_table"] = sensor_table(m)
     return out
+
+
+def sensor_table(m, rates=(1000, 240, 120, 60, 30), latencies=(5, 10, 20, 33, 50)):
+    """Loop crossover at 60 deg of phase margin when the position comes from an external sensor
+    sampling at `rate` with a total `latency` (exposure to controller): tau_b = latency + 1/(2 rate)."""
+    rows = []
+    for rate in rates:
+        for lat in latencies:
+            r = kp_for_pm(60, dict(m, tau_b=lat * 1e-3 + 0.5 / rate))
+            rows.append(dict(rate_hz=rate, latency_ms=lat, kp60=r["kp"], fc60_hz=r["fc_hz"]))
+    return rows
 
 
 # --------------------------------------------------------------------------- #
@@ -2923,9 +3311,10 @@ def parse_args(argv=None):
                    help="servomulti sine frequencies [Hz] (joints = --multi-joints)")
     g = p.add_argument_group("replay (policy-like action streams, joints = --multi-joints)")
     g.add_argument("--replay-modes", type=lambda s: [x.strip() for x in s.split(",") if x.strip()],
-                   default=["vel", "ff", "pos"],
+                   default=["vel", "ff", "pos", "posi"],
                    help="interfaces: vel = host loop (Kp --servo-kp) + feedforward, ff = feedforward only, "
-                        "pos = one MoveJoints per action with blending")
+                        "pos = one MoveJoints per action with blending, posi = MoveJoints every --pos-interp-ms "
+                        "to the host-interpolated position, --posi-adv-ms ahead")
     g.add_argument("--ref-file", default=None,
                    help="CSV of actions: t [s], q1..q6 [deg] (header allowed); default: synthetic motion")
     g.add_argument("--ref-absolute", dest="ref_relative", action="store_false",
@@ -2941,6 +3330,33 @@ def parse_args(argv=None):
                    help="publish each chunk this early, before its first action is due [ms]")
     g.add_argument("--ref-seed", type=int, default=0, help="random seed of the synthetic actions")
     g.add_argument("--replay-settle", type=float, default=0.5, help="start of the analysis window [s]")
+    g.add_argument("--ref-predict", choices=("linear", "quad"), default="linear",
+                   help="extrapolation past the last released action: last slope, or slope + its last change")
+    g.add_argument("--pos-interp-ms", type=float, default=5.0, help="posi mode: one MoveJoints every ... [ms]")
+    g.add_argument("--posi-adv-ms", type=float, default=None,
+                   help="posi mode: send the position this far ahead [ms]; default tau + T/2 + P/2 + servo lag")
+    g = p.add_argument_group("external sensor (servo, servomulti, replay vel/ff, sensorsweep)")
+    g.add_argument("--fb-delay-ms", type=float, default=0.0, help="extra delay of the position fed back [ms]")
+    g.add_argument("--fb-rate-hz", type=float, default=0.0,
+                   help="sensor rate: the position is sampled and held at this rate (0 = every loop tick)")
+    g.add_argument("--fb-noise-deg", type=float, default=0.0, help="white noise on the position fed back [deg]")
+    g.add_argument("--sensor-rates", type=fl, default=fl("0,120,60,30"), help="sensorsweep rates [Hz], 0 = encoder")
+    g.add_argument("--sensor-delays", type=fl, default=fl("0,20"), help="sensorsweep extra delays [ms]")
+    g.add_argument("--sensor-freqs", type=fl, default=fl("1,2"), help="sensorsweep sine frequencies [Hz]")
+    g.add_argument("--sensor-pm", type=float, default=60.0, help="sensorsweep: Kp for this phase margin [deg]")
+    g.add_argument("--sensor-base-fb-ms", type=float, default=3.7,
+                   help="sensorsweep: feedback age before the sensor, to choose Kp [ms] (measured 2026-11-25)")
+    g = p.add_argument_group("Cartesian velocity (cartvel)")
+    g.add_argument("--cart-axes", type=lambda s: [x.strip() for x in s.split(",") if x.strip()],
+                   default=["x", "z", "rz"], help="axes among x, y, z, rx, ry, rz")
+    g.add_argument("--cart-frame", choices=("wrf", "trf"), default="wrf", help="MoveLinVelWrf or MoveLinVelTrf")
+    g.add_argument("--cart-pose", type=fl, default=fl("0,0,0,0,45,0"),
+                   help="joint pose [deg] the Cartesian steps start from (home has J5 = 0: wrist singularity)")
+    g.add_argument("--cart-amp-mm", type=float, default=20.0, help="linear step [mm/s]")
+    g.add_argument("--cart-amp-deg", type=float, default=10.0, help="angular step [deg/s]")
+    g.add_argument("--cart-max-mm", type=float, default=15.0, help="linear excursion bound [mm]")
+    g.add_argument("--cart-max-deg", type=float, default=10.0, help="angular excursion bound [deg]")
+    g.add_argument("--cart-acc-pcts", type=fl, default=[], help="SetCartAcc values to sweep [%%] (default: as is)")
     g.add_argument("--model-tau", type=float, default=None, help="model delay for predictions [ms] (no step test)")
     g.add_argument("--model-T", type=float, default=None, help="model moving average [ms] (no step test)")
     p.add_argument("--out", default=None, help="output folder")
@@ -3134,6 +3550,23 @@ def print_summary(S):
                   f"{_f(r['shape_rel_pct'], '6.1f')} | {_f(r['max_err_deg'], '6.3f')} | {_f(r['accel_rms'], '7.0f')} | "
                   f"{_f(r['stall_pct'], '5.1f')} | {_f(r['sat_pct'], '5.1f')} | {_f(r['backlog_ms'], '6.1f')}"
                   + ("  STOPPED EARLY" if r.get("aborted") else ""))
+    if S.get("cartvel"):
+        print("\nCARTVEL (MoveLinVel steps: target velocity = delay tau + moving average T)")
+        for r in S["cartvel"]:
+            acc = "" if r["cart_acc_pct"] is None else f" SetCartAcc {r['cart_acc_pct']:g} %"
+            print(f"  {r['axis']:2s} +/-{r['amplitude']:g} {r['unit']}{acc} | tau {_f(r['tau_ms'])} ms | "
+                  f"T {_f(r['T_ms'])} ms | eq. delay {_f(r['eq_delay_ms'])} ms | servo lag "
+                  f"{_f(r.get('servo_lag_ms'))} ms | fit rms {_f(r['fit_rms'], '.3f')}")
+    if S.get("sensorsweep"):
+        x = S["sensorsweep"]
+        print(f"\nSENSORSWEEP (host loop through an emulated sensor, Kp for {x['pm']:g} deg of phase margin, "
+              f"noise {x['noise_deg']:g} deg)")
+        for r in x["rows"]:
+            gains = " | ".join(f"{k[5:]} {r[k]:.3f} (model {r['model_' + k]:.3f})" for k in r if k.startswith("gain_"))
+            print(f"  {'encoder' if r['rate_hz'] <= 0 else f'{r['rate_hz']:g} Hz':8s} +{r['delay_ms']:3g} ms | fb age "
+                  f"{_f(r['fb_age_ms'], '5.1f')} ms | Kp {r['kp']:5.1f} | model fc {_f(r['model_fc_hz'], '4.1f')} Hz PM "
+                  f"{_f(r['model_pm_deg'], '4.0f')} | overshoot {_f(r['overshoot_pct'], '5.1f')} (model "
+                  f"{_f(r['model_overshoot_pct'], '5.1f')}) % | gain {gains}")
     if "external_loop_prediction" in S:
         x = S["external_loop_prediction"]
         print(f"\nPREDICTED HOST POSITION LOOP (P controller via MoveJointsVel; model from {x['model_source']})")
@@ -3144,6 +3577,13 @@ def print_summary(S):
             r = x[f"pm{pm}"]
             print(f"  phase margin {pm} deg: Kp {r['kp']:5.1f} 1/s -> crossover {r['fc_hz']:4.1f} Hz, "
                   f"gain margin {_f(r['gm_db'], '4.1f')} dB")
+        if x.get("sensor_table"):
+            lats = sorted({r["latency_ms"] for r in x["sensor_table"]})
+            print("  external sensor -> crossover at 60 deg [Hz]; rows: sensor rate, columns: total latency [ms]")
+            print("            " + "".join(f"{lat:>7g}" for lat in lats))
+            for rate in sorted({r["rate_hz"] for r in x["sensor_table"]}, reverse=True):
+                vals = {r["latency_ms"]: r["fc60_hz"] for r in x["sensor_table"] if r["rate_hz"] == rate}
+                print(f"  {rate:6g} Hz " + "".join(f"{vals[lat]:7.1f}" for lat in lats))
     t = S.get("timing", {})
     print("\nTIMING (median / p95, ms)")
     for k, v in t.items():
@@ -3213,6 +3653,11 @@ def analyze_all(raw, frames, send_logs, args, out, plt):
             lambda r: plot_servomulti(raw["servomulti"], r, out, plt))
     if "replay" in raw and raw["replay"]["runs"]:
         run("replay", lambda: analyze_replay(raw["replay"], cmap), lambda r: plot_replay(raw["replay"], r, out, plt))
+    if "sensorsweep" in raw and raw["sensorsweep"]["configs"]:
+        run("sensorsweep", lambda: analyze_sensorsweep(raw["sensorsweep"], cmap, mdl),
+            lambda r: plot_sensorsweep(raw["sensorsweep"], r, out, plt))
+    if "cartvel" in raw and raw["cartvel"]["runs"]:
+        run("cartvel", lambda: analyze_cartvel(raw["cartvel"], cmap), lambda r: plot_cartvel(raw["cartvel"], out, plt))
     run("external_loop_prediction", lambda: predict_external_loop(S, args, mdl))
     S["robot_info"] = raw.get("_robot_info")
     S["config"] = {k: v for k, v in vars(args).items()}
