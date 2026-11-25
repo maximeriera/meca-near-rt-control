@@ -2338,10 +2338,12 @@ def analyze_replay(res, cmap):
                        stall_pct=100 * float(np.mean(np.abs(tv[fast]) < 0.1 * np.max(rs))) if fast.any() else math.nan)
             if run["mode"] in ("vel", "ff"):
                 row["sat_pct"] = 100 * float(np.mean(np.abs(L[:, 3 + j]) >= 0.999 * res["vmax"][j]))
-            if run["mode"] in ("pos", "posi"):  # target still moving after the last MoveJoints was sent
+            if run["mode"] in ("pos", "posi"):  # target still moving after the last new position was sent
                 tv_all = fr[:, col(K_TVEL, j)]
                 mv = np.isfinite(tv_all) & (np.abs(tv_all) > 0.2)
-                row["backlog_ms"] = (float(tm[np.nonzero(mv)[0][-1]]) - run["t_last"]) * 1e3 if mv.any() else math.nan
+                ch = np.nonzero(np.abs(np.diff(L[:, 3 + j])) > 1e-9)[0]
+                t_cmd = L[ch[-1] + 1, 1] if len(ch) else run["t_last"]
+                row["backlog_ms"] = (float(tm[np.nonzero(mv)[0][-1]]) - t_cmd) * 1e3 if mv.any() else math.nan
             rows.append(row)
     res["rows"] = rows
     modes = list(dict.fromkeys(r["mode"] for r in rows))
