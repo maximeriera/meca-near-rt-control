@@ -708,8 +708,9 @@ def make_reference(a, js, vlim_all):
 def policy_effects(t, q, a, js):
     """What a policy adds to a clean motion: actions published by chunks of --ref-chunk (all known
     when the chunk's first action is due), a random offset per chunk (--ref-chunk-offset-deg: the
-    jumps seen between chunks), white noise per action (--ref-noise-deg) and a late publication
-    per chunk (exponential, mean --ref-jitter-ms). Returns (q, release times)."""
+    jumps seen between chunks), white noise per action (--ref-noise-deg), a late publication per
+    chunk (exponential, mean --ref-jitter-ms), and an early publication (--ref-lead-ms: the next
+    chunk is out before its first action is due, as with asynchronous inference). Returns (q, release)."""
     rng = np.random.default_rng(a.ref_seed + 1)
     n, N = len(t), max(1, int(a.ref_chunk))
     chunk = np.arange(n) // N
@@ -722,7 +723,7 @@ def policy_effects(t, q, a, js):
     if a.ref_noise_deg > 0:
         q[:, js] += rng.normal(0.0, a.ref_noise_deg, (n, len(js)))
     jit = rng.exponential(a.ref_jitter_ms * 1e-3, nc) if a.ref_jitter_ms > 0 else np.zeros(nc)
-    release = t[chunk * N] + jit[chunk]
+    release = t[chunk * N] - a.ref_lead_ms * 1e-3 + jit[chunk]
     return q, release
 
 
@@ -1349,7 +1350,7 @@ class Tester:
             out["runs"].append(dict(mode=mode, **res))
             self.home()
             if res["aborted"]:
-                break
+                print(f"    '{mode}' stopped early (error above --servo-abort); going on with the next interface")
         return out
 
     def run_servomulti(self):
@@ -2059,7 +2060,7 @@ def analyze_replay(res, cmap):
             acc = np.gradient(tv, tm[ok]) if np.isfinite(tv).sum() > 10 else np.full(tv.shape, math.nan)
             rs = np.abs(R.true_slope(tt[ok] - d, j))
             fast = rs > 0.5 * np.max(rs) if np.max(rs) > 0 else np.zeros(rs.shape, bool)
-            row = dict(mode=run["mode"], joint=j + 1, ref_rms_deg=ref_rms,
+            row = dict(mode=run["mode"], joint=j + 1, aborted=bool(run.get("aborted")), ref_rms_deg=ref_rms,
                        rms_err_deg=float(np.sqrt(np.mean(e ** 2))), max_err_deg=float(np.max(np.abs(e))),
                        rel_err_pct=100 * float(np.sqrt(np.mean(e ** 2))) / ref_rms, delay_ms=d * 1e3,
                        shape_err_deg=shape, shape_rel_pct=100 * shape / ref_rms,
@@ -2074,7 +2075,8 @@ def analyze_replay(res, cmap):
             rows.append(row)
     res["rows"] = rows
     modes = list(dict.fromkeys(r["mode"] for r in rows))
-    per_mode = [dict(mode=mo, **{k: nmed([r.get(k) for r in rows if r["mode"] == mo])
+    per_mode = [dict(mode=mo, aborted=any(r["aborted"] for r in rows if r["mode"] == mo),
+                     **{k: nmed([r.get(k) for r in rows if r["mode"] == mo])
                                  for k in ("rel_err_pct", "rms_err_deg", "max_err_deg", "delay_ms", "shape_rel_pct",
                                            "accel_rms", "stall_pct", "sat_pct", "backlog_ms")}) for mo in modes]
     return dict(source=res["source"], P_action_ms=res["P_action"] * 1e3, chunk=res["chunk"],
@@ -2935,6 +2937,8 @@ def parse_args(argv=None):
     g.add_argument("--ref-chunk-offset-deg", type=float, default=0.0, help="random jump between chunks [deg]")
     g.add_argument("--ref-noise-deg", type=float, default=0.0, help="white noise per action [deg]")
     g.add_argument("--ref-jitter-ms", type=float, default=0.0, help="mean late publication per chunk [ms]")
+    g.add_argument("--ref-lead-ms", type=float, default=0.0,
+                   help="publish each chunk this early, before its first action is due [ms]")
     g.add_argument("--ref-seed", type=int, default=0, help="random seed of the synthetic actions")
     g.add_argument("--replay-settle", type=float, default=0.5, help="start of the analysis window [s]")
     g.add_argument("--model-tau", type=float, default=None, help="model delay for predictions [ms] (no step test)")
@@ -3128,7 +3132,8 @@ def print_summary(S):
         for r in x["per_mode"]:
             print(f"  {r['mode']:4s} | {_f(r['rel_err_pct'], '6.1f')} | {_f(r['delay_ms'], '6.1f')} | "
                   f"{_f(r['shape_rel_pct'], '6.1f')} | {_f(r['max_err_deg'], '6.3f')} | {_f(r['accel_rms'], '7.0f')} | "
-                  f"{_f(r['stall_pct'], '5.1f')} | {_f(r['sat_pct'], '5.1f')} | {_f(r['backlog_ms'], '6.1f')}")
+                  f"{_f(r['stall_pct'], '5.1f')} | {_f(r['sat_pct'], '5.1f')} | {_f(r['backlog_ms'], '6.1f')}"
+                  + ("  STOPPED EARLY" if r.get("aborted") else ""))
     if "external_loop_prediction" in S:
         x = S["external_loop_prediction"]
         print(f"\nPREDICTED HOST POSITION LOOP (P controller via MoveJointsVel; model from {x['model_source']})")

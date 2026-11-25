@@ -87,6 +87,9 @@ def test_policy_effects_chunks_and_release():
     assert np.all(rel[:4] == rel[0]) and rel[4] >= t[4]       # a chunk is released at once, never early
     assert np.all(q[:4, 5] == 0) and np.ptp(q[4:8, 5]) == 0   # first chunk clean, one offset per chunk
     assert np.all(q[:, :5] == 0)                              # inactive joints untouched
+    a = m.parse_args(["--ref-chunk", "4", "--ref-lead-ms", "30"])
+    _, rel = m.policy_effects(t, np.zeros((len(t), m.NJ)), a, [5])
+    assert rel[4] == pytest.approx(t[4] - 0.03)               # next chunk out 30 ms before it is due
 
 
 # --------------------------------------------------------------------------- end to end (simulator)
