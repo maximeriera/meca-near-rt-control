@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::actionref::{ActionRef, SensorEmu};
 use crate::bus::{Controller, Cycle, Feedback, Flow};
-use crate::controllers::{next_move_id, ClearMotion, Still};
+use crate::controllers::{next_move_id_not, ClearMotion, Still};
 use crate::into_any;
 use crate::pdo::{cmd, col, Outputs, HOST, K_APOS, K_TPOS, ROBOT};
 
@@ -447,7 +447,7 @@ impl Controller for PosStream {
                         for j in 0..6 {
                             goal[j] = self.q0[j] + q[j];
                         }
-                        let mid = next_move_id();
+                        let mid = next_move_id_not(fb.inp.move_id);
                         out.queued(cmd::MOVE_JOINTS, &goal, mid);
                         self.waiting = Some(mid);
                         self.last_goal = goal;

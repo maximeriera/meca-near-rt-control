@@ -7,8 +7,11 @@
 //! heartbeat. A log row therefore holds the ts / t1 / t2 of the cycle that carries the command,
 //! and the robot / host time of the frame it was computed from.
 //!
-//! Nothing allocates or locks in the cycle (rings to the writer and the orchestrator, try_lock
-//! for the snapshot), except at a safety trip or an emergency exit.
+//! Our own code does not allocate or lock in the cycle (rings to the writer and the orchestrator,
+//! try_lock for the snapshot), except at a safety trip or an emergency exit. The ethercrab
+//! exchange itself (smol::block_on(group.tx_rx())) does some of that internally: a timer per frame
+//! for the PDU timeout, wakers, the PDI lock. It cannot be avoided with ethercrab 0.7.1; the bus
+//! cycle statistics (wake-up lateness, tx_rx round trip) show its cost.
 
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,8 +21,12 @@ use rtrb::{Consumer, Producer};
 
 use crate::controllers::ExitSeq;
 use crate::fieldbus::{BusError, Fieldbus};
-use crate::pdo::{col, frame_row, Codec, Inputs, Outputs, Row, IN_LEN, K_APOS, K_TPOS, NCOL, OUT_LEN};
+use crate::pdo::{col, frame_row, Codec, Inputs, Outputs, Row, HOST, IN_LEN, K_APOS, K_TPOS, NCOL, OUT_LEN};
 use crate::rt;
+
+/// A test motion stops when no new robot sample has arrived for this long, even if the exchanges
+/// still succeed (frozen robot clock): a host loop must not keep acting on stale feedback.
+pub const FROZEN_FEEDBACK_S: f64 = 0.05;
 
 pub struct Cycle {
     /// Cycle number since the bus thread started.
@@ -141,6 +148,7 @@ pub struct BusStats {
     /// Exchanges with a working counter below the full one (outputs not processed).
     pub partial: u64,
     pub ring_drops: u64,
+    pub cycle_drops: u64,
     pub max_wkc: u16,
     pub backwards: u64,
     pub rt_problems: Vec<String>,
@@ -194,6 +202,12 @@ impl Core {
         self.frame_idx
     }
 
+    /// The full working counter, as seen when the robot reached OP. Without it a fresh Core
+    /// learns it from its first exchange, which is wrong if the robot already fell to SAFE-OP.
+    pub fn set_expected_wkc(&mut self, w: u16) {
+        self.stats.max_wkc = w;
+    }
+
     /// One cycle: controller -> outputs -> exchange -> inputs -> record -> guard.
     pub fn cycle(&mut self, bus: &mut dyn Fieldbus, mut ctrl: Option<&mut dyn Controller>, cx: &Cycle) -> Flow {
         let flow = match ctrl.as_mut() {
@@ -214,6 +228,15 @@ impl Core {
             c.sent(cx, t1, t2);
         }
         self.absorb(res, cx.ts, t1, t2);
+        if self.guard.active
+            && self.guard.tripped.is_none()
+            && self.fb.have_row
+            && t2 - self.fb.row[HOST] > FROZEN_FEEDBACK_S
+        {
+            self.guard.tripped =
+                Some(format!("no new robot sample for {:.0} ms (frozen feedback)", (t2 - self.fb.row[HOST]) * 1e3));
+            self.guard.fired = true;
+        }
         flow
     }
 
@@ -282,7 +305,9 @@ impl Core {
         self.fb.ok_age = t2 - self.last_ok;
         self.fb.next_frame = self.frame_idx;
         if let Some(s) = self.sinks.as_mut() {
-            let _ = s.cycles.push([ts, t1, t2, robot_t, if fresh { 1.0 } else { 0.0 }, wkc as f64]);
+            if s.cycles.push([ts, t1, t2, robot_t, if fresh { 1.0 } else { 0.0 }, wkc as f64]).is_err() {
+                self.stats.cycle_drops += 1;
+            }
         }
     }
 
@@ -595,6 +620,21 @@ mod tests {
         sim.mute = true;
         let mut ex = ExitSeq::new();
         assert!(run_sync(&mut c, &mut sim, &mut ex, 30.0));
-        assert!(!sim.has_left_ethercat() && ex.link_lost_after.is_some());
+        assert!(!sim.has_left_ethercat() && ex.skipped && !ex.confirmed());
+    }
+
+    #[test]
+    fn frozen_feedback_trips_the_guard() {
+        let mut c = core();
+        let mut sim = SimRobot::new(SimConfig::default());
+        assert!(run_sync(&mut c, &mut sim, &mut Bits::activate(false), 2.0));
+        c.guard.cfg = Some(GuardCfg { start: c.fb.inp.joint_set, max_exc: 45.0 });
+        c.guard.active = true;
+        let row = c.fb.row;
+        c.fb.row[HOST] = row[HOST] - 1.0; // last sample "1 s ago", and no new one: mute the robot
+        sim.mute = true;
+        let mut w = crate::controllers::WaitStill::new(0.2);
+        run_sync(&mut c, &mut sim, &mut w, 0.5);
+        assert!(c.guard.tripped.as_deref().is_some_and(|m| m.contains("frozen")), "{:?}", c.guard.tripped);
     }
 }
