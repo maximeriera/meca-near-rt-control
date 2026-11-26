@@ -145,7 +145,7 @@ fn run_inner(a: &RunArgs) -> Result<u8> {
             }
         };
         // ---- the way back: TCP port 10000 must answer (else restore, second master)
-        let back = lifecycle::come_back(&a.ecat, true);
+        let back = lifecycle::come_back(&a.ecat, true, true);
         (d, back)
     };
     clock.push(rt::clock_pair());

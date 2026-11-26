@@ -314,7 +314,8 @@ mod imp {
                 bail!("the robot did not reach OP in 10 s ({last})");
             }
             rt::sleep_s(o.cycle_s());
-        }
+        };
+        
         say!("  robot in OP (working counter {expected_wkc})");
         info.insert("expected_wkc".into(), json!(expected_wkc));
         let gr = &group;

@@ -199,7 +199,7 @@ pub fn probe(p: ProbeArgs) -> ExitCode {
     if let Err(e) = r {
         say!("probe: {e:#}");
     }
-    if lifecycle::come_back(o, true) {
+    if lifecycle::come_back(o, true, true) {
         ExitCode::from(0)
     } else {
         ExitCode::from(10)
