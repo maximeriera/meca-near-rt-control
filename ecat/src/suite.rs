@@ -274,14 +274,30 @@ impl<'t, 'r> Tester<'t, 'r> {
     fn quick_estimates(&mut self, step: &Value) {
         match self.try_quick(step) {
             Ok(q) => {
-                self.measured_acc = q.measured_acc;
-                self.quick_servo_lag = q.servo_lag_ms;
-                if let Some(a) = q.measured_acc {
+                // Sanity bounds: a wrong robot clock map (2026-11-26: robot timestamp stalls) gave
+                // tau 295 ms / T 4160 ms and a feedforward advance of -497 ms. Outside these
+                // bounds the estimate is ignored and the J6 law is used.
+                let sane_acc = q.measured_acc.filter(|a| a.is_finite() && *a > 10.0 && *a < 1e6);
+                let sane_lag = q.servo_lag_ms.filter(|l| l.is_finite() && (-5.0..=50.0).contains(l));
+                self.measured_acc = sane_acc;
+                self.quick_servo_lag = sane_lag;
+                if let Some(a) = sane_acc {
                     say!("  measured target acceleration ~ {a:.0} deg/s^2");
+                } else if q.measured_acc.is_some() {
+                    say!("  measured acceleration {:?} deg/s^2 out of bounds: ignored", q.measured_acc);
                 }
-                if let (Some(tau), Some(t)) = (q.tau_ms, q.t_ms) {
-                    self.quick = Some((tau, t));
-                    say!("  model: tau ~ {tau:.2} ms, T ~ {t:.2} ms");
+                if q.servo_lag_ms.is_some() && sane_lag.is_none() {
+                    say!("  servo lag {:?} ms out of bounds: ignored", q.servo_lag_ms);
+                }
+                match (q.tau_ms, q.t_ms) {
+                    (Some(tau), Some(t)) if (0.0..=50.0).contains(&tau) && (1.0..=500.0).contains(&t) => {
+                        self.quick = Some((tau, t));
+                        say!("  model: tau ~ {tau:.2} ms, T ~ {t:.2} ms");
+                    }
+                    (Some(tau), Some(t)) => {
+                        say!("  model tau {tau:.1} ms / T {t:.1} ms out of bounds (robot clock map?): J6 law used");
+                    }
+                    _ => {}
                 }
             }
             Err(e) => say!("  quick model not available ({e:#}): J6 law"),

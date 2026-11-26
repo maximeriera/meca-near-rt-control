@@ -1805,24 +1805,10 @@ def clock_map(host, robot, win=1.0):
     return lambda x: np.asarray(x) + np.polyval(p, np.asarray(x) - r0)
 
 
-def clock_map_ecat(host, robot, bin_s=0.01):
-    """Robot timestamp -> host clock for EtherCAT runs (raw['_ecat'], written by meca_ecat).
-
-    The master and the robot both tick every ~1 ms, each on its own clock, so the age of the data
-    a frame brings (host_rx - robot_ts) is not a random transport delay as over TCP: it is a
-    sawtooth up to one cycle high that wraps every 1 / drift (a 'beat', ~25 s at 40 ppm). Minima
-    over 1 s windows (clock_map) follow that sawtooth and can sit up to one cycle late.
-    A sample cannot reach the host before the robot stamped it, so the map is the highest line
-    under every point (host_rx - robot_ts against robot_ts): the edge of their lower convex hull
-    at the mean robot time. Over at least one beat it rests on the bottoms of the sawtooth (offset +
-    drift + minimum transport, like clock_map over TCP); over less, it can still be up to one cycle
-    late: the returned function carries drift (s/s) and span (s) so ecat_timing can say so.
-    Points are thinned to the minimum of each bin_s bin first (error <= drift * bin_s)."""
-    ok = np.isfinite(host) & np.isfinite(robot)
-    h, r = np.asarray(host, float)[ok], np.asarray(robot, float)[ok]
-    r0 = float(r[0])
-    x, d = r - r0, h - r
-    b = np.floor(x / bin_s).astype(np.int64)
+def _hull_line(x, d, bin_s=0.01):
+    """(slope, intercept) of the edge of the lower convex hull of (x, d) at the mean x: the highest
+    line under every point. Points are thinned to the minimum of each bin_s bin first."""
+    b = np.floor((x - x[0]) / bin_s).astype(np.int64)
     order = np.lexsort((d, b))
     _, first = np.unique(b[order], return_index=True)
     idx = order[first]                      # one point per bin: its minimum, in time order
@@ -1845,12 +1831,51 @@ def clock_map_ecat(host, robot, bin_s=0.01):
     else:
         if len(hull) > 1 and xm > hull[-1][0]:
             icpt = hull[-1][1]
+    return slope, icpt
+
+
+def clock_map_ecat(host, robot, bin_s=0.01, stall_s=0.002):
+    """Robot timestamp -> host clock for EtherCAT runs (raw['_ecat'], written by meca_ecat).
+
+    The master and the robot both tick every ~1 ms, each on its own clock, so the age of the data
+    a frame brings (host_rx - robot_ts) is not a random transport delay as over TCP: it is a
+    sawtooth up to one cycle high that wraps every 1 / drift (a 'beat', ~15 s at 65 ppm). Minima
+    over 1 s windows (clock_map) follow that sawtooth and can sit up to one cycle late.
+    A sample cannot reach the host before the robot stamped it, so the map rests on the highest
+    line under the points (host_rx - robot_ts against robot_ts): the edge of their lower convex
+    hull. Over at least one beat it lies on the bottoms of the sawtooth (offset + drift + minimum
+    transport, like clock_map over TCP); over less, it can be up to one cycle late.
+
+    The Meca500 timestamp also STALLS: it stops while the exchanges go on, then resumes where it
+    stopped (first run 2026-11-26, fw 11.3.3: 25 stalls, 1.28 s in 214 s, mostly during activation
+    and homing, 3-60 ms during tests). Each stall makes host_rx - robot_ts jump up. So the session
+    is cut at every jump above stall_s; the drift (the robot clock rate, continuous) comes from the
+    longest segment, and each segment gets its own offset: its lowest point once the drift is
+    removed. The returned function carries drift (s/s), span (s, longest segment), stalls and
+    stall_lost (s) for ecat_timing."""
+    ok = np.isfinite(host) & np.isfinite(robot)
+    h, r = np.asarray(host, float)[ok], np.asarray(robot, float)[ok]
+    r0 = float(r[0])
+    x, d = r - r0, h - r
+    jump = np.diff(d) > stall_s
+    starts = np.r_[0, np.nonzero(jump)[0] + 1]
+    ends = np.r_[starts[1:], len(d)]
+    seg_len = x[ends - 1] - x[starts]
+    L = int(np.argmax(seg_len))
+    if ends[L] - starts[L] > 2:
+        slope, _ = _hull_line(x[starts[L]:ends[L]], d[starts[L]:ends[L]], bin_s)
+    else:
+        slope = 0.0
+    offs = np.array([float(np.min(d[a:b] - slope * x[a:b])) for a, b in zip(starts, ends)])
+    seg_x0 = x[starts]
 
     def cm(xx):
         xx = np.asarray(xx, float)
-        return xx + icpt + slope * (xx - r0)
+        k = np.clip(np.searchsorted(seg_x0, xx - r0, side="right") - 1, 0, len(offs) - 1)
+        return xx + offs[k] + slope * (xx - r0)
 
-    cm.drift, cm.span, cm.offset = float(slope), float(x[-1] - x[0]), float(icpt)
+    cm.drift, cm.span = float(slope), float(seg_len[L])
+    cm.stalls, cm.stall_lost = int(jump.sum()), float(np.sum(np.diff(d)[jump]))
     return cm
 
 
@@ -2355,6 +2380,8 @@ def analyze_ecat_timing(ecat, frames, cmap):
         out["beat_s"] = beat if math.isfinite(beat) else None
         out["beats_covered"] = cmap.span / beat if math.isfinite(beat) else 0.0
         out["robot_clock_map_ok"] = bool(out["beats_covered"] >= 1.0)
+        out["robot_clock_stalls"] = getattr(cmap, "stalls", 0)
+        out["robot_clock_stall_lost_s"] = getattr(cmap, "stall_lost", 0.0)
     if len(frames):
         out["data_age_ms"] = tail(frames[:, HOST] - cmap(frames[:, ROBOT]), 1e3)
     return out
@@ -3976,6 +4003,9 @@ def print_summary(S):
                   f"{x['beats_covered']:.1f} beats recorded"
                   + ("" if x.get("robot_clock_map_ok") else
                      ": less than one beat, robot-clock delays may read up to one cycle late"))
+            if x.get("robot_clock_stalls"):
+                print(f"  robot clock stalled {x['robot_clock_stalls']} times ({x['robot_clock_stall_lost_s']:.3f} s "
+                      "in all): the clock map has one offset per segment between stalls")
         print("  (TIMING below: MoveJointsVel_call = tx_rx round trip of the cycle that carries the command; "
               "host-seen delays have a one-cycle resolution)")
     t = S.get("timing", {})

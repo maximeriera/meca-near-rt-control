@@ -48,6 +48,22 @@ def test_clock_map_ecat_finds_the_bottom_of_the_beat():
     assert cm.span / beat > 2                                  # 60 s = 2.4 beats
 
 
+def test_clock_map_ecat_survives_robot_clock_stalls():
+    """Robot timestamp frozen for a while, then resuming where it stopped (seen on the Meca500,
+    mostly during activation / homing): one offset per segment, the drift of the longest one."""
+    h, r, host_of = _beat_run(dur=60.0)
+    lost = np.zeros(len(r))
+    for t_stall, ms in ((0.5, 479.0), (2.0, 10.0), (2.1, 70.0), (40.0, 4.0)):
+        lost[r > t_stall] += ms * 1e-3       # host time spent while the robot clock was frozen
+    h = h + lost
+    cm = m.clock_map_ecat(h, r)
+    err = cm(r) - (host_of(r) + lost)
+    assert cm.stalls == 4 and cm.stall_lost == pytest.approx(0.563, abs=2e-3)
+    assert np.max(np.abs(err[r > 3.0] - 90e-6)) < 1e-4, (err.min(), err.max())   # long segments
+    assert np.max(np.abs(err - 90e-6)) < 1.1e-3                                    # short ones: < 1 cycle
+    assert cm.drift == pytest.approx(40e-6, abs=3e-6)
+
+
 def test_clock_map_ecat_less_than_one_beat_is_flagged():
     h, r, _ = _beat_run(drift=5e-6, dur=20.0)                  # beat 200 s, 0.1 beat recorded
     cm = m.clock_map_ecat(h, r)
