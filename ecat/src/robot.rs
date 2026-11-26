@@ -378,6 +378,8 @@ where
     // exchanges process data until the bus thread starts (the SM watchdog is ~100 ms; with
     // mlockall every allocated page is touched now). The writer thread grows the store.
     let shared = Shared::new(&core);
+    // 1<<16 rows = 65 s at 1 kHz (28 MB of frames). It grows in the writer thread, never in the
+    // bus thread. 1<<20 was 432 MB, refused by malloc under mlockall without cap_ipc_lock.
     let store = Mutex::new(Store {
         frames: Vec::with_capacity(1 << 16),
         cycles: Vec::with_capacity(1 << 16),
