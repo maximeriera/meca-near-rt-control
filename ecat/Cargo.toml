@@ -1,0 +1,32 @@
+[package]
+name = "meca_ecat"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Meca500 latency tests over EtherCAT (Rust side of meca_latency_test.py)"
+publish = false
+
+[features]
+default = ["suite"]
+# The test suite (run / worker). Without it (--no-default-features) only the EtherCAT life cycle
+# tools are built: probe, restore, status. Build that first on a new station.
+suite = []
+
+[dependencies]
+# EtherCAT master. Pinned: the life cycle code relies on its 0.7.1 API (see src/lifecycle.rs).
+ethercrab = { version = "=0.7.1", default-features = false, features = ["std"] }
+smol = "2"
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+libc = "0.2"
+rtrb = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+roxmltree = "0.20"
+
+[profile.release]
+debug = 1          # symbols for perf / backtraces
+panic = "unwind"   # the orchestrator catches panics to still disable EtherCAT

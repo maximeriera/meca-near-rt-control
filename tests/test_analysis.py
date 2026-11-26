@@ -228,7 +228,8 @@ def test_sim_sensorsweep_and_cartvel(tmp_path):
 
 
 # --------------------------------------------------------------------------- recorded runs (slow)
-RUNS = sorted(d for d in glob.glob(os.path.join(ROOT, "meca_latency_2026*"))
+RUNS = sorted(d for pat in ("meca_latency_2026*", "meca_latency_ecat_2026*")   # TCP runs and meca_ecat runs
+              for d in glob.glob(os.path.join(ROOT, pat))
               if os.path.isfile(os.path.join(d, "raw.pkl.gz")) and os.path.isfile(os.path.join(d, "summary.json")))
 
 

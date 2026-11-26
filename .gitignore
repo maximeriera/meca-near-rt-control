@@ -7,3 +7,6 @@ __pycache__/
 aggregate*/
 *.pcap
 *.pcapng
+# meca_ecat (Rust) build output and dry-run folders
+ecat/target/
+meca_latency_ecat_*/

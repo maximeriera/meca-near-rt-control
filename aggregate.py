@@ -86,6 +86,7 @@ def run_settings(folder, S):
         "run": os.path.basename(folder.rstrip("/\\")),
         "date": f"{m.group(1)[:4]}-{m.group(1)[4:6]}-{m.group(1)[6:]} {m.group(2)[:2]}:{m.group(2)[2:4]}" if m else "",
         "sim": c.get("sim"),
+        "transport": c.get("transport", "tcp"),       # "ethercat" for meca_ecat runs (ecat/)
         "joint": c.get("joint"),
         "vel_limit_pct": c.get("vel_limit_pct"),
         "joint_acc_pct": acc if acc is not None else info.get("joint_acc_pct"),
@@ -108,6 +109,8 @@ def run_row(base, S):
     acc = (st.get("target") or {}).get("accel_deg_s2") or {}
     row["target_accel_deg_s2"] = acc.get("median")
     row.update(flatten({"timing": S.get("timing")}))
+    if S.get("ecat_timing"):
+        row.update(flatten({"ecat": S["ecat_timing"]}))
     row.update(flatten({"pred": S.get("external_loop_prediction")}))
     sv = S.get("servo") or {}
     if sv:

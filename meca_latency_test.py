@@ -82,6 +82,10 @@ Usage
   python meca_latency_test.py --ip 192.168.0.100 --tests step,servo --vel-limit-pct 15
   python meca_latency_test.py --reanalyze meca_latency_20261125_101500   # redo analysis + plots
 
+EtherCAT: ecat/ (meca_ecat, Rust, Linux RT) runs step, sine, accsweep, multijoint, servo, servomulti,
+replay and soak over EtherCAT at 1 ms; ecat_bridge.py imports its runs into this format and analyses
+them here (raw["_ecat"]: EtherCAT clock map clock_map_ecat + ecat_timing). See ecat/README.md.
+
 Settings left on the robot: position tests leave SetJointVel at --pos-joint-vel-pct and
 SetBlending at --blending; jaccsweep restores SetJointAcc to --joint-acc-pct (or the 80 %
 activation default).
@@ -1801,6 +1805,62 @@ def clock_map(host, robot, win=1.0):
     return lambda x: np.asarray(x) + np.polyval(p, np.asarray(x) - r0)
 
 
+def clock_map_ecat(host, robot, bin_s=0.01):
+    """Robot timestamp -> host clock for EtherCAT runs (raw['_ecat'], written by meca_ecat).
+
+    The master and the robot both tick every ~1 ms, each on its own clock, so the age of the data
+    a frame brings (host_rx - robot_ts) is not a random transport delay as over TCP: it is a
+    sawtooth up to one cycle high that wraps every 1 / drift (a 'beat', ~25 s at 40 ppm). Minima
+    over 1 s windows (clock_map) follow that sawtooth and can sit up to one cycle late.
+    A sample cannot reach the host before the robot stamped it, so the map is the highest line
+    under every point (host_rx - robot_ts against robot_ts): the edge of their lower convex hull
+    at the mean robot time. Over at least one beat it rests on the bottoms of the sawtooth (offset +
+    drift + minimum transport, like clock_map over TCP); over less, it can still be up to one cycle
+    late: the returned function carries drift (s/s) and span (s) so ecat_timing can say so.
+    Points are thinned to the minimum of each bin_s bin first (error <= drift * bin_s)."""
+    ok = np.isfinite(host) & np.isfinite(robot)
+    h, r = np.asarray(host, float)[ok], np.asarray(robot, float)[ok]
+    r0 = float(r[0])
+    x, d = r - r0, h - r
+    b = np.floor(x / bin_s).astype(np.int64)
+    order = np.lexsort((d, b))
+    _, first = np.unique(b[order], return_index=True)
+    idx = order[first]                      # one point per bin: its minimum, in time order
+    hull = []
+    for px, py in zip(x[idx].tolist(), d[idx].tolist()):
+        while len(hull) >= 2:
+            (ax, ay), (bx, by) = hull[-2], hull[-1]
+            if (bx - ax) * (py - ay) - (by - ay) * (px - ax) <= 0:   # b is not below a -> p
+                hull.pop()
+            else:
+                break
+        hull.append((px, py))
+    xm = float(np.mean(x))
+    slope, icpt = 0.0, hull[0][1]
+    for (ax, ay), (bx, by) in zip(hull[:-1], hull[1:]):
+        if ax <= xm <= bx and bx > ax:
+            slope = (by - ay) / (bx - ax)
+            icpt = ay - slope * ax
+            break
+    else:
+        if len(hull) > 1 and xm > hull[-1][0]:
+            icpt = hull[-1][1]
+
+    def cm(xx):
+        xx = np.asarray(xx, float)
+        return xx + icpt + slope * (xx - r0)
+
+    cm.drift, cm.span, cm.offset = float(slope), float(x[-1] - x[0]), float(icpt)
+    return cm
+
+
+def run_clock_map(raw, frames):
+    """The clock map of a run: the EtherCAT one when meca_ecat recorded it, else the TCP one."""
+    if isinstance(raw, dict) and raw.get("_ecat"):
+        return clock_map_ecat(frames[:, HOST], frames[:, ROBOT])
+    return clock_map(frames[:, HOST], frames[:, ROBOT])
+
+
 def prep(fr, cmap):
     d = dict(h=fr[:, HOST], r=fr[:, ROBOT], tp=fr[:, TPOS], tv=fr[:, TVEL],
              ap=fr[:, APOS], av=fr[:, AVEL])
@@ -2111,11 +2171,12 @@ def analyze_step(res, cmap, fit=True):
     return summ
 
 
-def quick_accel(res):
-    """(target acceleration [deg/s^2], target -> actual lag at 50 % [ms]) from a step test, None if unknown."""
+def quick_accel(res, cmap=None):
+    """(target acceleration [deg/s^2], target -> actual lag at 50 % [ms]) from a step test, None if unknown.
+    cmap: clock map to use (meca_ecat passes the EtherCAT one); default: built from the step frames."""
     try:
         allf = np.vstack([r["frames"] for r in res["runs"]])
-        cm = clock_map(allf[:, HOST], allf[:, ROBOT])
+        cm = cmap or clock_map(allf[:, HOST], allf[:, ROBOT])
         s = analyze_step(dict(res), cm, fit=False)
         lag = s.get("servo_lag_target_to_actual_ms")
         return s["target"]["accel_deg_s2"]["median"], (lag["median"] if lag else None)
@@ -2123,10 +2184,10 @@ def quick_accel(res):
         return None, None
 
 
-def quick_model(res):
+def quick_model(res, cmap=None):
     try:
         allf = np.vstack([r["frames"] for r in res["runs"]])
-        cm = clock_map(allf[:, HOST], allf[:, ROBOT])
+        cm = cmap or clock_map(allf[:, HOST], allf[:, ROBOT])
         return model_summary([fit_boxcar(r["cmd"][:, 1], r["cmd"][:, 3], cm(r["frames"][:, ROBOT]),
                                          r["frames"][:, TVEL]) for r in res["runs"][:2]])
     except Exception:  # noqa: BLE001
@@ -2263,6 +2324,40 @@ def analyze_timing(frames, send_logs, cmap):
     return out, dict(rdt=gaps, hdt=np.diff(h), lat=h - m,
                      late=(c[:, 1] - c[:, 0]) if c is not None else None,
                      call=(c[:, 2] - c[:, 1]) if c is not None else None)
+
+
+ECAT_CYCLE_COLS = ("ts", "t1", "t2", "robot_ts", "fresh", "wkc")
+
+
+def analyze_ecat_timing(ecat, frames, cmap):
+    """EtherCAT bus of a meca_ecat run. bus_cycles holds one row per cycle: deadline ts, t1 just
+    before the exchange, t2 when it returned, robot timestamp (NaN if the exchange failed), 1 if
+    it brought a new robot sample, working counter (-1 if the exchange failed)."""
+    B = np.asarray(ecat.get("bus_cycles", np.empty((0, 6))), float).reshape(-1, 6)
+    cyc = float(ecat.get("cycle_s") or 1e-3)
+    out = dict(cycle_ms=cyc * 1e3, cycles=int(len(B)), byte_order=ecat.get("byte_order"),
+               byte_order_confirmed=ecat.get("byte_order_confirmed"), overruns=ecat.get("overruns"),
+               ring_drops=ecat.get("ring_drops"), sim=bool(ecat.get("sim", False)))
+    if len(B) > 1:
+        ts, t1, t2, _, fresh, wkc = B.T
+        ok = wkc >= 0
+        out["wake_late_ms"] = tail(t1 - ts, 1e3)          # includes the controller's own compute time
+        out["txrx_roundtrip_ms"] = tail((t2 - t1)[ok], 1e3)
+        out["cycle_interval_ms"] = tail(np.diff(t1), 1e3)
+        out["fresh_pct"] = 100 * float(np.mean(fresh[ok] > 0)) if ok.any() else math.nan
+        out["failed_exchanges"] = int(np.sum(~ok))
+        exp = ecat.get("expected_wkc")
+        out["bad_wkc"] = int(np.sum(ok & (wkc != exp))) if exp else None
+    drift = getattr(cmap, "drift", None)
+    if drift is not None:
+        beat = cyc / abs(drift) if drift else math.inf
+        out["drift_ppm"] = drift * 1e6
+        out["beat_s"] = beat if math.isfinite(beat) else None
+        out["beats_covered"] = cmap.span / beat if math.isfinite(beat) else 0.0
+        out["robot_clock_map_ok"] = bool(out["beats_covered"] >= 1.0)
+    if len(frames):
+        out["data_age_ms"] = tail(frames[:, HOST] - cmap(frames[:, ROBOT]), 1e3)
+    return out
 
 
 def analyze_accsweep(res, cmap):
@@ -3866,6 +3961,23 @@ def print_summary(S):
             for rate in sorted({r["rate_hz"] for r in x["sensor_table"]}, reverse=True):
                 vals = {r["latency_ms"]: r["fc60_hz"] for r in x["sensor_table"] if r["rate_hz"] == rate}
                 print(f"  {rate:6g} Hz " + "".join(f"{vals[lat]:7.1f}" for lat in lats))
+    if S.get("ecat_timing"):
+        x = S["ecat_timing"]
+        tl = lambda d: "n/a" if not d else f"{d['median']:6.3f} / {d['p99']:6.3f} / {d['p999']:6.3f} / {d['max']:7.3f}"
+        print(f"\nETHERCAT BUS ({x['cycles']} cycles of {x['cycle_ms']:g} ms, byte order {x.get('byte_order')}"
+              + (" (sim)" if x.get("sim") else "") + "; median / p99 / p99.9 / max in ms)")
+        print(f"  wake-up late {tl(x.get('wake_late_ms'))} | tx_rx round trip {tl(x.get('txrx_roundtrip_ms'))}")
+        print(f"  cycle interval {tl(x.get('cycle_interval_ms'))} | data age at the host {tl(x.get('data_age_ms'))}")
+        print(f"  new robot sample in {_f(x.get('fresh_pct'), '5.1f')} % of cycles | overruns {x.get('overruns')} | "
+              f"failed exchanges {x.get('failed_exchanges')} | bad WKC {x.get('bad_wkc')} | ring drops {x.get('ring_drops')}")
+        if x.get("drift_ppm") is not None:
+            beat = x.get("beat_s")
+            print(f"  robot clock drift {x['drift_ppm']:+.1f} ppm -> beat {_f(beat, '.0f')} s, "
+                  f"{x['beats_covered']:.1f} beats recorded"
+                  + ("" if x.get("robot_clock_map_ok") else
+                     ": less than one beat, robot-clock delays may read up to one cycle late"))
+        print("  (TIMING below: MoveJointsVel_call = tx_rx round trip of the cycle that carries the command; "
+              "host-seen delays have a one-cycle resolution)")
     t = S.get("timing", {})
     print("\nTIMING (median / p95, ms)")
     for k, v in t.items():
@@ -3886,7 +3998,7 @@ def _try(name, fn):
 
 def analyze_all(raw, frames, send_logs, args, out, plt):
     print(f"\nAnalysing {len(frames)} feedback frames -> {out}/")
-    cmap = clock_map(frames[:, HOST], frames[:, ROBOT])
+    cmap = run_clock_map(raw, frames)
     S = {}
 
     def run(name, an, pl=None):
@@ -3899,6 +4011,8 @@ def analyze_all(raw, frames, send_logs, args, out, plt):
 
     S["timing"], td = analyze_timing(frames, send_logs, cmap)
     _try("timing plot", lambda: plot_timing(td, out, plt))
+    if raw.get("_ecat"):
+        run("ecat_timing", lambda: analyze_ecat_timing(raw["_ecat"], frames, cmap))
     if "step" in raw:
         run("step", lambda: analyze_step(raw["step"], cmap), lambda r: plot_step(raw["step"], out, plt))
     mdl = pick_model(S, args)
@@ -3952,28 +4066,38 @@ def analyze_all(raw, frames, send_logs, args, out, plt):
     return S
 
 
+def reanalyze(folder, out=None, show=False):
+    """Redo the analysis and plots of a v2 run folder (this script's, or meca_ecat's once imported
+    by ecat_bridge.py). --out keeps the original summary / plots untouched. Returns the summary."""
+    import matplotlib
+    if not show:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    p = os.path.join(folder, "raw.pkl.gz")
+    if not os.path.exists(p):
+        sys.exit(f"{p} not found (only runs recorded with v2 of this script can be re-analysed)")
+    out = out or folder
+    os.makedirs(out, exist_ok=True)
+    with gzip.open(p, "rb") as f:
+        D = pickle.load(f)
+    saved = argparse.Namespace(**{**vars(parse_args([])), **D["args"]})
+    saved.reanalyze, saved.show, saved.out = folder, show, out
+    apply_joint_vmax(saved)
+    S = analyze_all(D["raw"], D["frames"], D["send_logs"], saved, out, plt)
+    if show:
+        plt.show()
+    return S
+
+
 def main():
     args = parse_args()
+    if args.reanalyze:
+        reanalyze(args.reanalyze, args.out, args.show)
+        return
     import matplotlib
     if not args.show:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-
-    if args.reanalyze:
-        p = os.path.join(args.reanalyze, "raw.pkl.gz")
-        if not os.path.exists(p):
-            sys.exit(f"{p} not found (only runs recorded with v2 of this script can be re-analysed)")
-        out = args.out or args.reanalyze  # --out keeps the original summary / plots untouched
-        os.makedirs(out, exist_ok=True)
-        with gzip.open(p, "rb") as f:
-            D = pickle.load(f)
-        saved = argparse.Namespace(**{**vars(parse_args([])), **D["args"]})
-        saved.reanalyze, saved.show, saved.out = args.reanalyze, args.show, out
-        apply_joint_vmax(saved)
-        analyze_all(D["raw"], D["frames"], D["send_logs"], saved, out, plt)
-        if args.show:
-            plt.show()
-        return
 
     # A 1 ms loop in Python needs the GIL to change hands quickly (default is 5 ms).
     sys.setswitchinterval(0.0002)
