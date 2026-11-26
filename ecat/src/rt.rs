@@ -149,8 +149,9 @@ pub fn can_realtime(prio: i32) -> Result<(), String> {
 // Stop signals                                                                                  //
 // --------------------------------------------------------------------------------------------- //
 
-/// Number of stop requests (Ctrl-C, SIGTERM, SIGHUP) received. 1: finish the current test cleanly
-/// and go to the exit sequence. 2: the bus thread starts the exit sequence itself, right away.
+/// Number of stop requests (Ctrl-C, SIGTERM, SIGHUP) received. 1: the running test motion is
+/// aborted at once (velocity zero, queued motion cleared), the completed tests are kept, then the
+/// exit sequence. 2: the bus thread starts the exit sequence itself, right away.
 /// The exit sequence itself (Deactivate + DisableEtherCAT) is never skipped: only Ctrl-\ (SIGQUIT,
 /// default action) kills the worker, and the supervisor then runs `restore`.
 pub static STOP: AtomicUsize = AtomicUsize::new(0);
