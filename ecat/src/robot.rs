@@ -216,8 +216,24 @@ impl<'a> Robot<'a> {
         }
     }
 
+    /// Wait until the bus thread has cycled and the robot answered (the snapshot is only
+    /// meaningful after that: before, it is the default feedback, "not activated, no error").
+    pub fn wait_ready(&self, timeout: f64) -> Result<()> {
+        let t_end = rt::now() + timeout;
+        loop {
+            if self.shared.heartbeat.load(Ordering::SeqCst) >= 20 && self.snapshot().fb.ok {
+                return Ok(());
+            }
+            if rt::now() > t_end {
+                bail!(Stop::BusLost);
+            }
+            rt::sleep_s(0.002);
+        }
+    }
+
     /// Activation, homing and the settings every run starts from. Returns the start joints.
     pub fn prepare(&mut self, p: &Prepare) -> Result<[f64; 6]> {
+        self.wait_ready(2.0)?;
         let s = self.snapshot();
         say!("Robot status: {}", s.fb.inp.status_line());
         if s.fb.inp.error_code != 0 {
@@ -292,7 +308,14 @@ impl<'a> Robot<'a> {
         while self.exit_done.is_none() {
             while let Ok(Event::Done(b, _)) = self.ev_rx.pop() {
                 if let Ok(e) = b.into_any().downcast::<ExitSeq>() {
-                    self.exit_done = Some(*e);
+                    if e.started() {
+                        self.exit_done = Some(*e);
+                    } else if !self.shared.emergency_exit.load(Ordering::SeqCst) {
+                        // handed back unrun (a controller was still running): install it again
+                        rt::sleep_s(0.005);
+                        let _ = self.push(Cmd::Install(Box::new(ExitSeq::new())));
+                    }
+                    // emergency: the bus thread runs its own, keep waiting for it
                 }
             }
             let now = rt::now();
@@ -309,7 +332,10 @@ impl<'a> Robot<'a> {
             }
             rt::sleep_s(0.002);
         }
-        let _ = self.push(Cmd::Shutdown);
+        let t_end = rt::now() + 2.0;
+        while self.push(Cmd::Shutdown).is_err() && rt::now() < t_end {
+            rt::sleep_s(0.001);
+        }
         self.exit_done.take()
     }
 }
@@ -348,28 +374,38 @@ pub fn drive<F, T>(fbus: F, mut core: Core, cfg: BusCfg, body: impl FnOnce(&mut 
 where
     F: Fieldbus,
 {
+    // Small up-front allocations only: when this runs the robot is already in OP and nothing
+    // exchanges process data until the bus thread starts (the SM watchdog is ~100 ms; with
+    // mlockall every allocated page is touched now). The writer thread grows the store.
     let shared = Shared::new(&core);
-    let store = Mutex::new(Store {
-        frames: Vec::with_capacity(1 << 20),
-        cycles: Vec::with_capacity(1 << 20),
-    });
+    let store = Mutex::new(Store { frames: Vec::with_capacity(1 << 14), cycles: Vec::with_capacity(1 << 14) });
     let (cmd_tx, cmd_rx) = RingBuffer::<Cmd>::new(64);
     let (ev_tx, ev_rx) = RingBuffer::<Event>::new(64);
-    let (fr_tx, fr_rx) = RingBuffer::<Row>::new(1 << 16);
-    let (cy_tx, cy_rx) = RingBuffer::<[f64; 6]>::new(1 << 16);
+    let (fr_tx, fr_rx) = RingBuffer::<Row>::new(1 << 14);
+    let (cy_tx, cy_rx) = RingBuffer::<[f64; 6]>::new(1 << 15);
     core.set_sinks(Sinks { frames: fr_tx, cycles: cy_tx });
     let wstop = AtomicBool::new(false);
     let cycle_s = cfg.cycle_s;
     let (body_res, exit, bus_rep) = std::thread::scope(|s| {
         let (sh, st, ws) = (&shared, &store, &wstop);
-        let bus = std::thread::Builder::new()
-            .name("ecat-bus".into())
-            .spawn_scoped(s, move || bus_thread(core, fbus, cmd_rx, ev_tx, sh, cfg))
-            .expect("spawn the bus thread");
-        let writer = std::thread::Builder::new()
+        let writer = match std::thread::Builder::new()
             .name("ecat-writer".into())
             .spawn_scoped(s, move || writer_thread(fr_rx, cy_rx, st, ws))
-            .expect("spawn the writer thread");
+        {
+            Ok(w) => w,
+            Err(e) => return (Err(anyhow!("cannot spawn the writer thread: {e}")), None, None),
+        };
+        let bus = match std::thread::Builder::new()
+            .name("ecat-bus".into())
+            .spawn_scoped(s, move || bus_thread(core, fbus, cmd_rx, ev_tx, sh, cfg))
+        {
+            Ok(b) => b,
+            Err(e) => {
+                ws.store(true, Ordering::SeqCst);
+                let _ = writer.join();
+                return (Err(anyhow!("cannot spawn the bus thread: {e}")), None, None);
+            }
+        };
         let mut robot = Robot::new(cmd_tx, ev_rx, sh, st, cycle_s);
         let body_res = match catch_unwind(AssertUnwindSafe(|| body(&mut robot))) {
             Ok(r) => r,
