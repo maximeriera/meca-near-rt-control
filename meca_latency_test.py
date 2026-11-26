@@ -1848,16 +1848,19 @@ def clock_map_ecat(host, robot, bin_s=0.01, stall_s=0.002):
 
     The Meca500 timestamp also STALLS: it stops while the exchanges go on, then resumes where it
     stopped (first run 2026-11-26, fw 11.3.3: 25 stalls, 1.28 s in 214 s, mostly during activation
-    and homing, 3-60 ms during tests). Each stall makes host_rx - robot_ts jump up. So the session
-    is cut at every jump above stall_s; the drift (the robot clock rate, continuous) comes from the
-    longest segment, and each segment gets its own offset: its lowest point once the drift is
-    removed. The returned function carries drift (s/s), span (s, longest segment), stalls and
-    stall_lost (s) for ecat_timing."""
+    and homing, 3-60 ms during tests). It also jumps FORWARD at times (a robot gap of 17 ms between
+    two consecutive samples 1 ms apart on the host). Each stall makes host_rx - robot_ts jump up,
+    each forward jump makes it jump down. So the session is cut at every jump above stall_s, either
+    way; the drift (the robot clock rate) comes from the longest segment, and each segment gets its
+    own offset: its lowest point once the drift is removed. The returned function carries drift
+    (s/s), span (s, longest segment), stalls / stall_lost (s) and jumps / jump_gained (s) for
+    ecat_timing."""
     ok = np.isfinite(host) & np.isfinite(robot)
     h, r = np.asarray(host, float)[ok], np.asarray(robot, float)[ok]
     r0 = float(r[0])
     x, d = r - r0, h - r
-    jump = np.diff(d) > stall_s
+    dd = np.diff(d)
+    jump = np.abs(dd) > stall_s
     starts = np.r_[0, np.nonzero(jump)[0] + 1]
     ends = np.r_[starts[1:], len(d)]
     seg_len = x[ends - 1] - x[starts]
@@ -1874,8 +1877,10 @@ def clock_map_ecat(host, robot, bin_s=0.01, stall_s=0.002):
         k = np.clip(np.searchsorted(seg_x0, xx - r0, side="right") - 1, 0, len(offs) - 1)
         return xx + offs[k] + slope * (xx - r0)
 
+    up, down = dd > stall_s, dd < -stall_s
     cm.drift, cm.span = float(slope), float(seg_len[L])
-    cm.stalls, cm.stall_lost = int(jump.sum()), float(np.sum(np.diff(d)[jump]))
+    cm.stalls, cm.stall_lost = int(up.sum()), float(np.sum(dd[up]))
+    cm.jumps, cm.jump_gained = int(down.sum()), float(-np.sum(dd[down]))
     return cm
 
 
@@ -2382,6 +2387,8 @@ def analyze_ecat_timing(ecat, frames, cmap):
         out["robot_clock_map_ok"] = bool(out["beats_covered"] >= 1.0)
         out["robot_clock_stalls"] = getattr(cmap, "stalls", 0)
         out["robot_clock_stall_lost_s"] = getattr(cmap, "stall_lost", 0.0)
+        out["robot_clock_jumps"] = getattr(cmap, "jumps", 0)
+        out["robot_clock_jump_gained_s"] = getattr(cmap, "jump_gained", 0.0)
     if len(frames):
         out["data_age_ms"] = tail(frames[:, HOST] - cmap(frames[:, ROBOT]), 1e3)
     return out
@@ -4003,9 +4010,10 @@ def print_summary(S):
                   f"{x['beats_covered']:.1f} beats recorded"
                   + ("" if x.get("robot_clock_map_ok") else
                      ": less than one beat, robot-clock delays may read up to one cycle late"))
-            if x.get("robot_clock_stalls"):
+            if x.get("robot_clock_stalls") or x.get("robot_clock_jumps"):
                 print(f"  robot clock stalled {x['robot_clock_stalls']} times ({x['robot_clock_stall_lost_s']:.3f} s "
-                      "in all): the clock map has one offset per segment between stalls")
+                      f"in all) and jumped forward {x.get('robot_clock_jumps', 0)} times "
+                      f"({x.get('robot_clock_jump_gained_s', 0.0):.3f} s): one clock offset per segment in between")
         print("  (TIMING below: MoveJointsVel_call = tx_rx round trip of the cycle that carries the command; "
               "host-seen delays have a one-cycle resolution)")
     t = S.get("timing", {})

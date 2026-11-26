@@ -55,12 +55,17 @@ def test_clock_map_ecat_survives_robot_clock_stalls():
     lost = np.zeros(len(r))
     for t_stall, ms in ((0.5, 479.0), (2.0, 10.0), (2.1, 70.0), (40.0, 4.0)):
         lost[r > t_stall] += ms * 1e-3       # host time spent while the robot clock was frozen
+    for t_jump, ms in ((50.0, 16.0), (55.0, 5.0)):   # robot clock jumps forward (17 ms robot gap seen)
+        lost[r > t_jump] -= ms * 1e-3
     h = h + lost
     cm = m.clock_map_ecat(h, r)
     err = cm(r) - (host_of(r) + lost)
     assert cm.stalls == 4 and cm.stall_lost == pytest.approx(0.563, abs=2e-3)
-    assert np.max(np.abs(err[r > 3.0] - 90e-6)) < 1e-4, (err.min(), err.max())   # long segments
-    assert np.max(np.abs(err - 90e-6)) < 1.1e-3                                    # short ones: < 1 cycle
+    assert cm.jumps == 2 and cm.jump_gained == pytest.approx(0.021, abs=2e-3)
+    long_seg = (r > 3.0) & (r < 40.0)                  # 38 s: more than one beat (25 s at 40 ppm)
+    assert np.max(np.abs(err[long_seg] - 90e-6)) < 1e-4, (err.min(), err.max())
+    # segments shorter than a beat: never early, at most one cycle late (ecat_timing says so)
+    assert -1e-4 < np.min(err - 90e-6) and np.max(err - 90e-6) < 1.1e-3
     assert cm.drift == pytest.approx(40e-6, abs=3e-6)
 
 
