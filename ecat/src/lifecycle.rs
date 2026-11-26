@@ -143,6 +143,11 @@ mod imp {
     static PDU_MAIN: Storage = PduStorage::new();
     static PDU_RESCUE: Storage = PduStorage::new();
 
+    /// PDO assignment of the ESI (11.3.1 = 11.3.3): every PDO, fixed mapping.
+    const RX_PDOS: [u16; 9] = [0x1600, 0x1601, 0x1602, 0x1610, 0x1611, 0x1620, 0x1621, 0x1622, 0x1623];
+    const TX_PDOS: [u16; 13] =
+        [0x1A00, 0x1A01, 0x1A02, 0x1A03, 0x1A08, 0x1A09, 0x1A0A, 0x1A10, 0x1A11, 0x1A20, 0x1A21, 0x1A22, 0x1A23];
+
     fn ec(e: ethercrab::error::Error) -> anyhow::Error {
         anyhow!("{e:?}")
     }
@@ -266,16 +271,63 @@ mod imp {
             if id.vendor_id != VENDOR_ID || id.product_id != PRODUCT_CODE {
                 bail!("{} is not a Meca500 (vendor {:#x}, product {:#x})", sd.name(), id.vendor_id, id.product_id);
             }
-            if so.scan_only {
-                return Ok(None);
-            }
             if so.sdo_disable {
                 say!("  SDO write DisableEtherCAT (0x7200:07 = 1) in PRE-OP");
                 smol::block_on(sd.sdo_write(0x7200, 7u8, 1u8)).map_err(ec).context("SDO 0x7200:07")?;
                 return Ok(None);
             }
+            // PDO assignment. into_safe_op reads it back over CoE (0x1C12 / 0x1C13, then each PDO)
+            // and ethercrab 0.7.1 does not skip an entry that reads 0: it then reads object 0x0000
+            // and fails with "Mailbox Aborted NotFound address 0" (seen on the Meca500, 11.3.3).
+            // Show what the robot reports; if it differs from the ESI, write the ESI assignment
+            // (PdoAssign is allowed, the objects are rw). status only reads.
+            for (idx, want) in [(0x1C12u16, &RX_PDOS[..]), (0x1C13u16, &TX_PDOS[..])] {
+                let n: u8 = smol::block_on(sd.sdo_read::<u8>(idx, 0u8)).map_err(ec).with_context(|| format!("SDO {idx:#06x}:00"))?;
+                let mut got: Vec<u16> = Vec::with_capacity(n as usize);
+                for i in 1..=n {
+                    match smol::block_on(sd.sdo_read::<u16>(idx, i)) {
+                        Ok(v) => got.push(v),
+                        Err(e) => {
+                            say!("  SDO {idx:#06x}:{i:02} read failed: {e:?}");
+                            got.push(0);
+                        }
+                    }
+                }
+                say!("  PDO assignment {idx:#06x}: {n} entries {got:04x?}");
+                info.insert(format!("assign_{idx:04x}_read"), json!(got));
+                if got.as_slice() != want && !so.scan_only {
+                    say!("  -> differs from the ESI: writing {want:04x?}");
+                    smol::block_on(sd.sdo_write_array(idx, want))
+                        .map_err(ec)
+                        .with_context(|| format!("SDO write of the PDO assignment {idx:#06x}"))?;
+                    let n2: u8 = smol::block_on(sd.sdo_read::<u8>(idx, 0u8)).map_err(ec)?;
+                    say!("     {idx:#06x}:00 now {n2}");
+                    info.insert(format!("assign_{idx:04x}_written"), json!(want));
+                }
+            }
+            if so.scan_only {
+                return Ok(None);
+            }
         }
-        let group = smol::block_on(group.into_safe_op(md)).map_err(ec).context("PRE-OP -> SAFE-OP")?;
+        let group = match smol::block_on(group.into_safe_op(md)) {
+            Ok(g) => g,
+            Err(e) => {
+                // no way to the OP sequence: still try to leave EtherCAT over CoE (fresh group,
+                // the failed transition consumed the previous one)
+                if so.sdo_if_no_op {
+                    say!("  no SAFE-OP: SDO write DisableEtherCAT (0x7200:07 = 1) in PRE-OP");
+                    if let Ok(g) = smol::block_on(md.init_single_group::<MAX_SD, PDI_LEN>(ethercat_now)) {
+                        if let Ok(sd) = g.subdevice(md, 0) {
+                            match smol::block_on(sd.sdo_write(0x7200, 7u8, 1u8)) {
+                                Ok(()) => say!("    written"),
+                                Err(e2) => say!("    refused: {e2:?}"),
+                            }
+                        }
+                    }
+                }
+                bail!("PRE-OP -> SAFE-OP: {e:?}");
+            }
+        };
         let (ilen, olen) = {
             let sd = group.subdevice(md, 0).map_err(ec)?;
             let io = sd.io_raw();
