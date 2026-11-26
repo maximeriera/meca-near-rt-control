@@ -76,6 +76,18 @@ def test_clock_map_ecat_less_than_one_beat_is_flagged():
     assert E["robot_clock_map_ok"] is False
 
 
+def test_target_vel_lag_finds_a_delayed_slot():
+    n = 5000
+    r = np.arange(n) * 1e-3
+    tp = np.cumsum(50 * np.sin(2 * np.pi * 2 * r)) * 1e-3
+    vb = np.r_[np.nan, np.diff(tp) / 1e-3]
+    for d in (0, 1):
+        fr = np.full((n, m.NCOL), np.nan)
+        fr[:, m.ROBOT], fr[:, m.TPOS] = r, tp
+        fr[:, m.TVEL] = np.r_[np.full(d, np.nan), vb[:n - d]]
+        assert m.target_vel_lag(fr) == pytest.approx(d, abs=0.05)
+
+
 def test_analyze_ecat_timing_columns():
     n = 1000
     ts = np.arange(n) * 1e-3

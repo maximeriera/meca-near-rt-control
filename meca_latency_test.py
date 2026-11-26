@@ -2391,7 +2391,46 @@ def analyze_ecat_timing(ecat, frames, cmap):
         out["robot_clock_jump_gained_s"] = getattr(cmap, "jump_gained", 0.0)
     if len(frames):
         out["data_age_ms"] = tail(frames[:, HOST] - cmap(frames[:, ROBOT]), 1e3)
+        out["target_vel_lag_samples"] = target_vel_lag(frames)
     return out
+
+
+def target_vel_lag(frames, max_shift=4, min_speed=1.0):
+    """How many robot samples the target velocity (TVEL) lags the backward difference of the
+    target position (TPOS) of the tested joint, sub-sample (parabola through the best shift).
+    Every TCP run of 2026-11-25 gives -0.50 (the robot's target velocity is the step to the next
+    sample): that is "same robot cycle". Over EtherCAT TPOS is a fixed PDO (0x6030) and TVEL a
+    dynamic data slot (type 32): +0.50 means the slots are one cycle older than the fixed PDOs,
+    which would also add 1 ms to the target -> actual servo lag measured from the slots (seen
+    2026-11-26: 1.5 ms over EtherCAT, 0.4 ms over TCP). Uses consecutive 1-cycle robot samples
+    where the joint moves; None if not enough of them."""
+    r, tp, tv = frames[:, ROBOT], frames[:, TPOS], frames[:, TVEL]
+    if not (np.isfinite(tp).sum() > 100 and np.isfinite(tv).sum() > 100):
+        return None
+    dr = np.diff(r)
+    step = np.median(dr[np.isfinite(dr)]) if np.isfinite(dr).any() else math.nan
+    if not np.isfinite(step) or step <= 0:
+        return None
+    vb = np.full(len(r), np.nan)
+    good = np.abs(dr - step) < 0.25 * step
+    vb[1:][good] = np.diff(tp)[good] / dr[good]        # backward difference, valid on 1-sample gaps
+    n = len(r)
+    costs = []
+    for s in range(-max_shift, max_shift + 1):
+        a = vb[max_shift:n - max_shift]
+        b = tv[max_shift + s:n - max_shift + s]
+        m = np.isfinite(a) & np.isfinite(b) & (np.abs(a) > min_speed)
+        costs.append(float(np.mean((a[m] - b[m]) ** 2)) if m.sum() > 100 else math.inf)
+    costs = np.array(costs)
+    if not np.isfinite(costs).any():
+        return None
+    k = int(np.argmin(costs))
+    frac = 0.0
+    if 0 < k < len(costs) - 1 and np.isfinite(costs[k - 1]) and np.isfinite(costs[k + 1]):
+        den = costs[k - 1] - 2 * costs[k] + costs[k + 1]
+        if den > 0:
+            frac = 0.5 * (costs[k - 1] - costs[k + 1]) / den
+    return float(k - max_shift + frac)
 
 
 def analyze_accsweep(res, cmap):
@@ -4002,6 +4041,10 @@ def print_summary(S):
               + (" (sim)" if x.get("sim") else "") + "; median / p99 / p99.9 / max in ms)")
         print(f"  wake-up late {tl(x.get('wake_late_ms'))} | tx_rx round trip {tl(x.get('txrx_roundtrip_ms'))}")
         print(f"  cycle interval {tl(x.get('cycle_interval_ms'))} | data age at the host {tl(x.get('data_age_ms'))}")
+        if x.get("target_vel_lag_samples") is not None:
+            print(f"  target velocity (dynamic slot) vs d/dt target position (fixed PDO): lag "
+                  f"{x['target_vel_lag_samples']:+.2f} robot samples (TCP runs: -0.50, both from the same "
+                  "cycle; +0.50 = the slots are one cycle older than the fixed PDOs)")
         print(f"  new robot sample in {_f(x.get('fresh_pct'), '5.1f')} % of cycles | overruns {x.get('overruns')} | "
               f"failed exchanges {x.get('failed_exchanges')} | bad WKC {x.get('bad_wkc')} | ring drops {x.get('ring_drops')}")
         if x.get("drift_ppm") is not None:
