@@ -10,7 +10,8 @@ can be compared directly. `aggregate.py` adds a `transport` column to tell them 
 soak, and timing, which is always on. Options keep the names and defaults of `meca_latency_test.py`,
 with two exceptions:
 - `--period` defaults to 1 ms, one cycle;
-- `--joint-acc-pct` is always applied (80 by default), because it cannot be read back over EtherCAT.
+- `--joint-acc-pct` is always applied (150 by default, the value of the TCP campaign; the robot
+  takes 100 at activation), because it cannot be read back over EtherCAT.
 
 ## The way back to TCP/IP (MecaPortal)
 

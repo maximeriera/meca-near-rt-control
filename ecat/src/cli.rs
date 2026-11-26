@@ -144,8 +144,9 @@ pub struct RunArgs {
     pub period: f64,
     #[arg(long, default_value_t = 25.0)]
     pub vel_limit_pct: f64,
-    /// SetJointAcc [%], always applied (not readable over EtherCAT); 80 = activation default
-    #[arg(long, default_value_t = 80.0)]
+    /// SetJointAcc [%], always applied (not readable over EtherCAT). Default 150, the value of the
+    /// TCP campaign (2026-11-25); the robot itself takes 100 at activation (R4 fw 11.3.3)
+    #[arg(long, default_value_t = 150.0)]
     pub joint_acc_pct: f64,
     #[arg(long, default_value_t = 0.05)]
     pub vel_timeout: f64,
