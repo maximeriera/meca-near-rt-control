@@ -117,6 +117,9 @@ fn run_inner(a: &RunArgs) -> Result<u8> {
         let d = drive(sim, core, cfg, |r| tests_body(r, &prep, &mut out, &info, a, &br, &py_args));
         (Some(d), true)
     } else {
+        // The closure returns (recorded run, exit sequence confirmed). Confirmed = DisableEtherCAT
+        // was sent and the robot then left the bus; not confirmed (skipped on a dead bus, or the
+        // robot still answering) -> come_back restores after 5 s instead of waiting --tcp-wait.
         let r = lifecycle::ecat_session(&a.ecat, SessionOpts::default(), |ctx| {
             slave = ctx.info.clone();
             order_used = ctx.order;
@@ -124,28 +127,31 @@ fn run_inner(a: &RunArgs) -> Result<u8> {
                 say!("Byte order unknown: no test, exit sequence only");
                 let ex = lifecycle::exit_on(ctx, cycle);
                 say!("  exit sequence: {}", ex.summary());
-                return Ok(None);
+                return Ok((None, ex.confirmed()));
             }
-            let core = Core::new(Codec::new(ctx.order), false, j, cycle, slots);
+            let mut core = Core::new(Codec::new(ctx.order), false, j, cycle, slots);
+            core.set_expected_wkc(ctx.expected_wkc);
             let d = drive((ctx.make)(), core, cfg.clone(), |r| tests_body(r, &prep, &mut out, &info, a, &br, &py_args));
-            let exit_ok = d.exit.as_ref().is_some_and(|e| e.link_lost_after.is_some());
-            if !exit_ok {
+            let mut confirmed = d.exit.as_ref().is_some_and(|e| e.confirmed());
+            if !confirmed {
                 // the bus thread could not finish it: once more from this thread, fresh exchange
                 say!("Exit sequence not confirmed on the bus thread: again from the main thread");
                 let ex = lifecycle::exit_on(ctx, cycle);
                 say!("  exit sequence: {}", ex.summary());
+                confirmed = ex.confirmed();
             }
-            Ok(Some(d))
+            Ok((Some(d), confirmed))
         });
-        let d = match r {
-            Ok(x) => x.flatten(),
+        let (d, confirmed) = match r {
+            Ok(Some((d, c))) => (d, c),
+            Ok(None) => (None, false),
             Err(e) => {
                 say!("EtherCAT session: {e:#}");
-                None
+                (None, false)
             }
         };
         // ---- the way back: TCP port 10000 must answer (else restore, second master)
-        let back = lifecycle::come_back(&a.ecat, true);
+        let back = lifecycle::come_back(&a.ecat, true, confirmed);
         (d, back)
     };
     clock.push(rt::clock_pair());

@@ -26,6 +26,8 @@ pub struct EcatCtx<'a> {
     pub make: &'a dyn Fn() -> Box<dyn Fieldbus + 'a>,
     pub order: ByteOrder,
     pub order_detected: bool,
+    /// Working counter of a full exchange, seen when the robot reached OP.
+    pub expected_wkc: u16,
     pub info: Map<String, Value>,
 }
 
@@ -277,7 +279,9 @@ mod imp {
         let (ilen, olen) = {
             let sd = group.subdevice(md, 0).map_err(ec)?;
             let io = sd.io_raw();
-            (io.inputs().len(), io.outputs().len())
+            let i = io.inputs().len();
+            let o = io.outputs().len();
+            (i, o)
         };
         info.insert("in_bytes".into(), json!(ilen));
         info.insert("out_bytes".into(), json!(olen));
@@ -288,7 +292,7 @@ mod imp {
         // cyclic zero outputs until the robot is in OP (the SM watchdog wants process data)
         let t_end = rt::now() + 10.0;
         let mut last = String::new();
-        loop {
+        let expected_wkc = loop {
             {
                 let sd = group.subdevice(md, 0).map_err(ec)?;
                 let mut out = sd.outputs_raw_mut();
@@ -297,7 +301,7 @@ mod imp {
                 }
             }
             match smol::block_on(group.tx_rx(md)) {
-                Ok(r) if r.all_op() => break,
+                Ok(r) if r.all_op() => break r.working_counter,
                 Ok(r) => last = format!("states {:?}", r.subdevice_states),
                 Err(e) => last = format!("{e:?}"),
             }
@@ -310,8 +314,10 @@ mod imp {
                 bail!("the robot did not reach OP in 10 s ({last})");
             }
             rt::sleep_s(o.cycle_s());
-        }
-        say!("  robot in OP");
+        };
+        
+        say!("  robot in OP (working counter {expected_wkc})");
+        info.insert("expected_wkc".into(), json!(expected_wkc));
         let gr = &group;
         let make = move || boxed(crate::fieldbus::FnBus(ecat_exchange!(gr, md)));
         // byte order, from ~150 cycles of inputs while nothing moves
@@ -332,7 +338,7 @@ mod imp {
         };
         info.insert("byte_order".into(), json!(order.name()));
         info.insert("byte_order_detected".into(), json!(detected));
-        let r = work(&EcatCtx { make: &make, order, order_detected: detected, info })?;
+        let r = work(&EcatCtx { make: &make, order, order_detected: detected, expected_wkc, info })?;
         Ok(Some(r))
     }
 }
@@ -376,6 +382,7 @@ pub fn ecat_session<R>(
 /// The exit sequence on the calling thread, on a fresh exchange (no bus thread).
 pub fn exit_on(ctx: &EcatCtx<'_>, cycle_s: f64) -> ExitSeq {
     let mut core = Core::new(Codec::new(ctx.order), false, 5, cycle_s, [0; 4]);
+    core.set_expected_wkc(ctx.expected_wkc);
     let mut fb = (ctx.make)();
     let mut ex = ExitSeq::new();
     run_sync(&mut core, &mut *fb, &mut ex, 40.0);
@@ -392,14 +399,20 @@ The robot did not come back on TCP/IP. Try, in this order:
      blink in sequence. IP 192.168.0.100, TCP/IP mode. Programs are kept.";
 
 /// Wait for TCP port 10000; if it does not answer, restore with a fresh master (in this process:
-/// second storage). Returns true once TCP/IP answers.
-pub fn come_back(o: &EcatOpts, rescue: bool) -> bool {
-    say!("Waiting for TCP/IP on {}:{} (up to {:.0} s)...", o.ip, tcp::PORT, o.tcp_wait);
-    if let Some((w, t)) = tcp::wait_alive(&o.ip, o.tcp_wait) {
+/// second storage). `confirmed`: the exit sequence saw the robot leave the bus after
+/// DisableEtherCAT (wait --tcp-wait for its network to come up); otherwise restore after 5 s.
+/// Returns true once TCP/IP answers.
+pub fn come_back(o: &EcatOpts, rescue: bool, confirmed: bool) -> bool {
+    let wait = if confirmed { o.tcp_wait } else { 5.0 };
+    say!("Waiting for TCP/IP on {}:{} (up to {:.0} s)...", o.ip, tcp::PORT, wait);
+    if let Some((w, t)) = tcp::wait_alive(&o.ip, wait) {
         say!("TCP/IP back after {t:.1} s: {w}  -> MecaPortal: http://{}", o.ip);
         return true;
     }
-    say!("No TCP/IP answer: restore with a fresh EtherCAT master");
+    say!(
+        "{}: restore with a fresh EtherCAT master",
+        if confirmed { "No TCP/IP answer" } else { "The exit sequence was not confirmed" }
+    );
     match restore(o, SessionOpts { rescue, sdo_if_no_op: true, ..Default::default() }) {
         Ok(true) => true,
         Ok(false) | Err(_) => {

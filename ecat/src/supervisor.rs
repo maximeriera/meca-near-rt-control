@@ -33,6 +33,12 @@ pub fn run(a: crate::cli::RunArgs) -> ExitCode {
     if let Some(p) = args.iter().position(|x| x == "run") {
         args[p] = "worker".into();
     }
+    // Before the spawn (no window where a Ctrl-C kills the supervisor). These are handlers, not
+    // SIG_IGN: exec resets them, so the worker starts with the default dispositions (Ctrl-\
+    // still kills it; it installs its own Ctrl-C / SIGTERM / SIGHUP handlers).
+    if let Err(e) = rt::install_supervisor_signals() {
+        say!("WARNING: {e}");
+    }
     let mut child = match Proc::new(&exe).args(&args).spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -40,10 +46,6 @@ pub fn run(a: crate::cli::RunArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    // after the spawn: the worker keeps the default dispositions (Ctrl-\ still kills it)
-    if let Err(e) = rt::install_supervisor_signals() {
-        say!("WARNING: {e}");
-    }
     let st = match child.wait() {
         Ok(s) => s,
         Err(e) => {
@@ -62,14 +64,15 @@ pub fn run(a: crate::cli::RunArgs) -> ExitCode {
     }
 }
 
-/// TCP/IP answers? Else restore (fresh process, so the main PDU storage is free).
+/// After an abnormal end of the worker: TCP/IP answers? Else restore (fresh process, so the main
+/// PDU storage is free). Exit code 2 (the tests did not end cleanly) once TCP/IP answers.
 fn check_and_restore(o: &EcatOpts) -> ExitCode {
     if let Some(w) = tcp::alive(&o.ip, Duration::from_secs(3)) {
         say!("TCP/IP answers on {}: {w}", o.ip);
-        return ExitCode::from(0);
+        return ExitCode::from(2);
     }
     match lifecycle::restore(o, SessionOpts { sdo_if_no_op: true, ..Default::default() }) {
-        Ok(true) => ExitCode::from(0),
+        Ok(true) => ExitCode::from(2),
         Ok(false) | Err(_) => {
             say!("{}", lifecycle::MANUAL_RESET);
             ExitCode::from(10)
@@ -175,6 +178,7 @@ pub fn probe(p: ProbeArgs) -> ExitCode {
     let r = lifecycle::ecat_session(o, SessionOpts::default(), |ctx| {
         say!("Slave: {}", serde_json::Value::Object(ctx.info.clone()));
         let mut core = Core::new(Codec::new(ctx.order), false, 5, cycle, o.slots());
+        core.set_expected_wkc(ctx.expected_wkc);
         let mut fb = (ctx.make)();
         let mut w = Watch { secs: p.seconds, t0: None, last_print: 0.0, cycles: 0, fresh: 0, failed: 0, first: None, last: None };
         run_sync(&mut core, &mut *fb, &mut w, p.seconds + 2.0);
@@ -194,12 +198,16 @@ pub fn probe(p: ProbeArgs) -> ExitCode {
         let mut ex = ExitSeq::new();
         run_sync(&mut core, &mut *fb, &mut ex, 40.0);
         say!("Exit sequence: {}", ex.summary());
-        Ok(())
+        Ok(ex.confirmed())
     });
-    if let Err(e) = r {
-        say!("probe: {e:#}");
-    }
-    if lifecycle::come_back(o, true) {
+    let confirmed = match r {
+        Ok(c) => c.unwrap_or(false),
+        Err(e) => {
+            say!("probe: {e:#}");
+            false
+        }
+    };
+    if lifecycle::come_back(o, true, confirmed) {
         ExitCode::from(0)
     } else {
         ExitCode::from(10)

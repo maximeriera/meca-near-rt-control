@@ -15,6 +15,17 @@ pub fn next_move_id() -> u16 {
     (MOVE_ID.fetch_add(1, Ordering::Relaxed) % 65535 + 1) as u16
 }
 
+/// A new MoveID different from the one the robot echoes now (a new process restarts at 1: the
+/// echo of a previous run must not be taken for the acknowledgement of this command).
+pub fn next_move_id_not(echo: u16) -> u16 {
+    loop {
+        let id = next_move_id();
+        if id != echo {
+            return id;
+        }
+    }
+}
+
 /// Counts consecutive new samples where the target joint positions did not move.
 #[derive(Clone, Copy, Default)]
 pub struct Still {
@@ -65,8 +76,12 @@ impl Bits {
     }
 
     /// Activate; `sim`: in the robot's own simulation mode (SimMode bit, the arm does not move).
+    /// Confirmed only when the simulation status matches: a robot already activated in real mode
+    /// never passes for a simulated one.
     pub fn activate(sim: bool) -> Bits {
-        Bits { sim_mode: Some(sim), ..Bits::new(BitSel::Activate, |i| i.activated, 30.0) }
+        let until: fn(&Inputs) -> bool =
+            if sim { |i| i.activated && i.sim_activated } else { |i| i.activated && !i.sim_activated };
+        Bits { sim_mode: Some(sim), ..Bits::new(BitSel::Activate, until, 30.0) }
     }
 
     pub fn home() -> Bits {
@@ -154,7 +169,7 @@ impl Controller for Config {
         match self.phase {
             0 => {
                 self.t0 = cx.ts;
-                self.mid = next_move_id();
+                self.mid = next_move_id_not(fb.inp.move_id);
                 out.queued(self.id, &[self.value, 0.0, 0.0, 0.0, 0.0, 0.0], self.mid);
                 self.phase = 1;
             }
@@ -333,7 +348,7 @@ impl Controller for MoveAndWait {
                 let vel = cmd::is_velocity(out.command_id) && out.move_id == 0;
                 out.zero_velocity();
                 if !vel || (self.still.n >= 10 && cx.ts - t0 > 0.02) || cx.ts - t0 > 2.0 {
-                    self.mid = next_move_id();
+                    self.mid = next_move_id_not(fb.inp.move_id);
                     out.queued(cmd::MOVE_JOINTS, &self.q, self.mid);
                     self.phase = 1;
                 }
@@ -403,6 +418,16 @@ impl ExitSeq {
         }
     }
 
+    /// It ran (not handed back unstarted by a busy bus thread).
+    pub fn started(&self) -> bool {
+        self.t0.is_some()
+    }
+
+    /// DisableEtherCAT was sent and the robot then left the bus (not skipped on a dead bus).
+    pub fn confirmed(&self) -> bool {
+        self.link_lost_after.is_some() && !self.skipped
+    }
+
     pub fn summary(&self) -> String {
         if self.skipped {
             return "bus already lost: nothing sent".into();
@@ -443,16 +468,18 @@ impl Controller for ExitSeq {
         out.resume_motion = false;
         match self.phase {
             0 => {
-                if !fb.ok && fb.ok_age > 0.5 && cx.ts - t0 > 0.05 {
-                    // nobody answers any more: the robot is gone already (or the cable)
+                out.zero_velocity();
+                if fb.ok {
+                    self.was_activated = fb.inp.activated;
+                    self.phase = 1;
+                    self.t_phase = cx.ts;
+                } else if fb.ok_age > 1.0 && cx.ts - t0 > 0.05 {
+                    // no working exchange for 1 s: the robot is gone (or the cable, or it fell
+                    // back to SAFE-OP): nothing reaches it, the caller restores
                     self.skipped = true;
                     self.link_lost_after = Some(0.0);
                     return Flow::Done;
                 }
-                self.was_activated = fb.inp.activated;
-                self.phase = 1;
-                self.t_phase = cx.ts;
-                out.zero_velocity();
             }
             1 => {
                 // stop: velocity zero; a queued motion is cleared (ClearMove pauses it)
