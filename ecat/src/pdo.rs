@@ -734,7 +734,7 @@ mod tests {
         i.joint_set = [1.0, 2.0, 3.0, 4.0, 5.0, 6.5];
         i.ts_s = 1234;
         i.ts_us = 567_000;
-        i.dyn_type = [32, 40, 42, 0];
+        i.dyn_type = [32, 40, 0, 0]; // no slot carries JOINT_VEL (42): AVEL must be NaN
         i.dyn_val[0] = [0.5; 6];
         i.dyn_val[1] = [7.0; 6];
         let mut b = [0u8; IN_LEN];

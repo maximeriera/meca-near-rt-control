@@ -349,9 +349,11 @@ where
     F: Fieldbus,
 {
     let shared = Shared::new(&core);
+    // 1<<16 rows = 65 s at 1 kHz (28 MB of frames). It grows in the writer thread, never in the
+    // bus thread. 1<<20 was 432 MB, refused by malloc under mlockall without cap_ipc_lock.
     let store = Mutex::new(Store {
-        frames: Vec::with_capacity(1 << 20),
-        cycles: Vec::with_capacity(1 << 20),
+        frames: Vec::with_capacity(1 << 16),
+        cycles: Vec::with_capacity(1 << 16),
     });
     let (cmd_tx, cmd_rx) = RingBuffer::<Cmd>::new(64);
     let (ev_tx, ev_rx) = RingBuffer::<Event>::new(64);
