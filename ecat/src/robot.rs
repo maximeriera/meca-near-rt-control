@@ -350,8 +350,8 @@ where
 {
     let shared = Shared::new(&core);
     let store = Mutex::new(Store {
-        frames: Vec::with_capacity(1 << 20),
-        cycles: Vec::with_capacity(1 << 20),
+        frames: Vec::with_capacity(1 << 16),
+        cycles: Vec::with_capacity(1 << 16),
     });
     let (cmd_tx, cmd_rx) = RingBuffer::<Cmd>::new(64);
     let (ev_tx, ev_rx) = RingBuffer::<Event>::new(64);
